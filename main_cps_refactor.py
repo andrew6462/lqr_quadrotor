@@ -11,6 +11,7 @@ What this file does (in plain student English)
 - Adds a simple **reference governor** so we don't blow past actuator limits.
 - Can run a few preset scenarios (hover, step in z, and a figure‑8) and spit out plots.
 - Has a small async batch mode so we can compare cases without waiting forever.
+- Optional **"bad‑K" toggle** to make the controller look over‑corrected/oscillatory on purpose.
 
 How we run it (examples)
 ------------------------
@@ -22,6 +23,9 @@ python main_cps_refactor.py --batch linear_vs_nonlinear --T 8 --Ts 0.004 --save-
 
 # Figure‑8 with RG (and integrator if Kc is available)
 python main_cps_refactor.py --plant nonlinear --traj figure8 --use-rg --T 10 --Ts 0.004 --save-prefix fig8
+
+# Make it look over‑corrected ("bad‑K" runtime hack)
+python main_cps_refactor.py --plant linear --traj step_z --T 8 --Ts 0.004 --bad-k --save-prefix badk_step
 
 Notes we kept for ourselves
 ---------------------------
@@ -262,7 +266,8 @@ def govern_reference(x: np.ndarray, v_prev: np.ndarray, r_target: np.ndarray,
 def simulate_one(name: str, plant: str, traj: str, T: float, Ts: float,
                  use_rg: bool, use_integrator: bool, gains: Gains,
                  angle_int_only: bool = True,
-                 z_final: float = 1.0, step_time: float = 0.5) -> SimResult:
+                 z_final: float = 1.0, step_time: float = 0.5,
+                 sensor_noise: float = 0.0, seed: Optional[int] = None) -> SimResult:
 
     # Select plant dynamics
     if plant == 'linear':
@@ -293,6 +298,7 @@ def simulate_one(name: str, plant: str, traj: str, T: float, Ts: float,
     x = np.zeros(12)
     v = np.zeros(12)
     xi = np.zeros(12)
+    rng = np.random.default_rng(seed) if sensor_noise and sensor_noise > 0 else None
 
     # Logs
     X = np.zeros((12, N+1)); X[:,0] = x
@@ -308,14 +314,19 @@ def simulate_one(name: str, plant: str, traj: str, T: float, Ts: float,
     for k in range(N):
         tk = t[k]
         r = r_of_t(tk)
+        # measurement noise for controller/RG view
+        if rng is not None:
+            x_meas = x + rng.normal(0.0, sensor_noise, size=12)
+        else:
+            x_meas = x
         if use_rg:
-            v = govern_reference(x, v, r, K=K, u_min=u_min, u_max=u_max)
+            v = govern_reference(x_meas, v, r, K=K, u_min=u_min, u_max=u_max)
         else:
             v = r
-        err = (x - v)
+        err = (x_meas - v)
         u = -K @ err
         if use_integrator and Kc is not None:
-            epos = v[pos_idx] - x[pos_idx]
+            epos = v[pos_idx] - x_meas[pos_idx]
             xi[pos_idx] += epos * Ts
             u = u - (Kc @ xi[pos_idx])  # assumes Kc maps 3 int‑errors → 4 inputs
         u_clip = np.minimum(np.maximum(u, u_min), u_max)
@@ -336,7 +347,8 @@ def simulate_one(name: str, plant: str, traj: str, T: float, Ts: float,
         meta={
             'plant': plant, 'traj': traj, 'T': T, 'Ts': Ts,
             'use_rg': use_rg, 'use_integrator': use_integrator,
-            'limits': {'u_min': u_min, 'u_max': u_max}
+            'limits': {'u_min': u_min, 'u_max': u_max},
+            'sensor_noise': sensor_noise, 'seed': seed
         }
     )
 
@@ -444,12 +456,13 @@ def plot_sim(res: SimResult, save_prefix: str = '') -> None:
 
 async def run_batch(kind: str, T: float, Ts: float, gains: Gains, save_prefix: str,
                     z_final: float, step_time: float) -> None:
-    tasks: List[asyncio.Task] = []
+    tasks: List[asyncio.Future] = []
     res_list: List[SimResult] = []
     loop = asyncio.get_running_loop()
     pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 
     def submit(name, plant, traj, use_rg, use_int):
+        # run_in_executor returns a Future; it's already awaitable, no need for create_task
         return loop.run_in_executor(
             pool,
             simulate_one,
@@ -457,20 +470,20 @@ async def run_batch(kind: str, T: float, Ts: float, gains: Gains, save_prefix: s
         )
 
     if kind == 'linear_vs_nonlinear':
-        tasks.append(asyncio.create_task(submit('linear_step', 'linear', 'step_z', False, False)))
-        tasks.append(asyncio.create_task(submit('nonlinear_step', 'nonlinear', 'step_z', False, False)))
-        tasks.append(asyncio.create_task(submit('nonlinear_step_rg', 'nonlinear', 'step_z', True, False)))
+        tasks.append(submit('linear_step', 'linear', 'step_z', False, False))
+        tasks.append(submit('nonlinear_step', 'nonlinear', 'step_z', False, False))
+        tasks.append(submit('nonlinear_step_rg', 'nonlinear', 'step_z', True, False))
     elif kind == 'full':
-        tasks.append(asyncio.create_task(submit('nl_step_rg', 'nonlinear', 'step_z', True, True)))
-        tasks.append(asyncio.create_task(submit('nl_fig8_rg', 'nonlinear', 'figure8', True, True)))
-        tasks.append(asyncio.create_task(submit('lin_step', 'linear', 'step_z', False, False)))
+        tasks.append(submit('nl_step_rg', 'nonlinear', 'step_z', True, True))
+        tasks.append(submit('nl_fig8_rg', 'nonlinear', 'figure8', True, True))
+        tasks.append(submit('lin_step', 'linear', 'step_z', False, False))
     else:
         print(f"[warn] Unknown batch '{kind}'. Running a default pair.")
-        tasks.append(asyncio.create_task(submit('linear_step', 'linear', 'step_z', False, False)))
-        tasks.append(asyncio.create_task(submit('nonlinear_step_rg', 'nonlinear', 'step_z', True, False)))
+        tasks.append(submit('linear_step', 'linear', 'step_z', False, False))
+        tasks.append(submit('nonlinear_step_rg', 'nonlinear', 'step_z', True, False))
 
-    for coro in asyncio.as_completed(tasks):
-        res = await coro
+    for fut in asyncio.as_completed(tasks):
+        res = await fut
         res_list.append(res)
         plot_sim(res, save_prefix=save_prefix)
 
@@ -490,11 +503,28 @@ def main():
     ap.add_argument('--step-time', type=float, default=0.5)
     ap.add_argument('--mat-dir', type=str, default='mat')
     ap.add_argument('--save-prefix', type=str, default='')
+    ap.add_argument('--bad-k', action='store_true', help='enable runtime K mangling to induce overshoot/oscillations')
+    # Async batch presets
+    ap.add_argument('--batch', choices=['', 'linear_vs_nonlinear', 'full'], default='')
     # Async batch presets
     ap.add_argument('--batch', choices=['', 'linear_vs_nonlinear', 'full'], default='')
     args = ap.parse_args()
 
     gains = load_gains(args.mat_dir)
+
+    # Optional: make it look over-corrected (runtime K hack)
+    if args.bad_k:
+        Kb = gains.K.copy()
+        # 1) overall scale up → cheaper inputs effectively
+        Kb *= 3.0
+        # 2) weaken rate feedback (xdot, ydot, zdot, phidot, thetadot, psidot) → less damping
+        rate_idx = [0, 2, 4, 6, 8, 10]
+        Kb[:, rate_idx] *= 0.3
+        # 3) strengthen position/angle feedback → more overreaction
+        posang_idx = [1, 3, 5, 7, 9, 11]
+        Kb[:, posang_idx] *= 1.8
+        gains = Gains(K=Kb, Kc=gains.Kc)
+        print('[info] bad-k: runtime K mangling enabled (expect overshoot/oscillations)')
 
     if args.batch:
         asyncio.run(run_batch(args.batch, args.T, args.Ts, gains, args.save_prefix, args.z_final, args.step_time))
