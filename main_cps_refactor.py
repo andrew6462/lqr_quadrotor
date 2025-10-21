@@ -2,37 +2,8 @@
 """
 Quadrotor LQR (Course Project) — driver script
 
-Authors: Andrew P., <Teammate B>, <Teammate C>  |  Course: CPS / Controls  |  Year: Junior (3rd)
+Authors: Andrew Pearce, Rocco DeLuca, Jacek Prucnal
 
-What this file does (in plain student English)
-----------------------------------------------
-- Lets us run the quadrotor with **linear** or **nonlinear** dynamics.
-- Uses our **LQR gains** (and integrator if we have Kc) to track references.
-- Adds a simple **reference governor** so we don't blow past actuator limits.
-- Can run a few preset scenarios (hover, step in z, and a figure‑8) and spit out plots.
-- Has a small async batch mode so we can compare cases without waiting forever.
-- Optional **"bad‑K" toggle** to make the controller look over‑corrected/oscillatory on purpose.
-
-How we run it (examples)
-------------------------
-# Nonlinear + RG, step in z (what we demoed in lab)
-python main_cps_refactor.py --plant nonlinear --traj step_z --use-rg --T 8 --Ts 0.004
-
-# Linear vs Nonlinear quick compare (runs the sims in parallel, then plots)
-python main_cps_refactor.py --batch linear_vs_nonlinear --T 8 --Ts 0.004 --save-prefix cmp
-
-# Figure‑8 with RG (and integrator if Kc is available)
-python main_cps_refactor.py --plant nonlinear --traj figure8 --use-rg --T 10 --Ts 0.004 --save-prefix fig8
-
-# Make it look over‑corrected ("bad‑K" runtime hack)
-python main_cps_refactor.py --plant linear --traj step_z --T 8 --Ts 0.004 --bad-k --save-prefix badk_step
-
-Notes we kept for ourselves
----------------------------
-- If `mat/K.mat` or `mat/control.mat` is present, we load K (and Kc). If not, we use a basic fallback K we tuned
-  for a ~0.6 kg mini‑quad just to keep the demo stable.
-- We avoided the `python-control` package here to keep the script lightweight for graders.
-- The reference governor is a line search between the last safe ref and the new command. It's simple but works.
 """
 
 from __future__ import annotations
@@ -50,7 +21,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.io import loadmat
 
 # ======================================================================================
-# ASSIGNMENT‑SPEC TUNING (edit here if your rubric lists different numbers)
+# ASSIGNMENT‑SPEC TUNING
 # ======================================================================================
 G = 9.81                 # gravity [m/s^2]
 M = 0.60                 # mass [kg]  (mini‑quad, per assignment vibe)
@@ -512,25 +483,11 @@ def main():
 
     gains = load_gains(args.mat_dir)
 
-    # Optional: make it look over-corrected (runtime K hack)
-    if args.bad_k:
-        Kb = gains.K.copy()
-        # 1) overall scale up → cheaper inputs effectively
-        Kb *= 3.0
-        # 2) weaken rate feedback (xdot, ydot, zdot, phidot, thetadot, psidot) → less damping
-        rate_idx = [0, 2, 4, 6, 8, 10]
-        Kb[:, rate_idx] *= 0.3
-        # 3) strengthen position/angle feedback → more overreaction
-        posang_idx = [1, 3, 5, 7, 9, 11]
-        Kb[:, posang_idx] *= 1.8
-        gains = Gains(K=Kb, Kc=gains.Kc)
-        print('[info] bad-k: runtime K mangling enabled (expect overshoot/oscillations)')
-
     if args.batch:
         asyncio.run(run_batch(args.batch, args.T, args.Ts, gains, args.save_prefix, args.z_final, args.step_time))
         return
 
-    # Single run path (no asyncio needed)
+    # Single run path
     res = simulate_one(
         name=f"{args.plant}_{args.traj}_rg{int(args.use_rg)}_int{int(args.use_integrator)}",
         plant=args.plant,

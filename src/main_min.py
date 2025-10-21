@@ -4,7 +4,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 
-# --- import from repo root (where main_cps_refactor.py lives) ---
+# --- import from repo root ---
 try:
     from main_cps_refactor import load_gains, simulate_one, plot_sim
 except ModuleNotFoundError:
