@@ -153,21 +153,21 @@ def load_gains(mat_dir: str = 'mat') -> Gains:
             except:
                 pass
     if K is None:
-        # Improved default gains
+        # More conservative default gains for better stability
         K = np.zeros((4, 12))
-        # Altitude control (stronger)
-        K[0, 4] = 5.0;
-        K[0, 5] = 6.0
-        # Roll control
-        K[1, 6] = 1.5;
-        K[1, 7] = 2.0;
-        K[1, 2] = 0.8;
-        K[1, 3] = 1.0
-        # Pitch control
-        K[2, 8] = 1.5;
-        K[2, 9] = 2.0;
-        K[2, 0] = 0.8;
-        K[2, 1] = 1.0
+        # Altitude control (strong but not aggressive)
+        K[0, 4] = 4.0;
+        K[0, 5] = 5.0
+        # Roll control (more damping)
+        K[1, 6] = 1.2;
+        K[1, 7] = 1.8;
+        K[1, 2] = 1.2;
+        K[1, 3] = 1.5
+        # Pitch control (more damping)
+        K[2, 8] = 1.2;
+        K[2, 9] = 1.8;
+        K[2, 0] = 1.2;
+        K[2, 1] = 1.5
         # Yaw control
         K[3, 10] = 1.0;
         K[3, 11] = 1.5
@@ -597,20 +597,32 @@ def traj_step_z(z_final: float = 0.5, t_step: float = 0.5) -> Callable[[float], 
     return r_of_t
 
 
-def traj_figure8(amp: float = 1.0, period: float = 6.0, z0: float = 0.5) -> Callable[[float], np.ndarray]:
-    """Figure-8 with proper velocity terms"""
+def traj_figure8(amp: float = 0.6, period: float = 8.0, z0: float = 0.5, t_start: float = 1.0) -> Callable[
+    [float], np.ndarray]:
+    """Figure-8 with proper velocity terms and gentler trajectory"""
     w = 2.0 * math.pi / period
 
     def r_of_t(t: float) -> np.ndarray:
         r = np.zeros(12)
-        # Position
-        r[1] = amp * math.sin(w * t)  # x
-        r[3] = amp * math.sin(2 * w * t)  # y
-        r[5] = z0  # z
-        # Velocity (CRITICAL for tracking!)
-        r[0] = amp * w * math.cos(w * t)  # xdot
-        r[2] = amp * 2 * w * math.cos(2 * w * t)  # ydot
-        r[4] = 0.0  # zdot
+
+        # First let altitude stabilize, then start XY motion
+        if t < t_start:
+            # Just climb to altitude
+            r[5] = z0 * min(t / t_start, 1.0)
+        else:
+            # Effective time for figure-8
+            t_eff = t - t_start
+
+            # Position
+            r[1] = amp * math.sin(w * t_eff)  # x
+            r[3] = amp * math.sin(2 * w * t_eff)  # y
+            r[5] = z0  # z
+
+            # Velocity (CRITICAL for tracking!)
+            r[0] = amp * w * math.cos(w * t_eff)  # xdot
+            r[2] = amp * 2 * w * math.cos(2 * w * t_eff)  # ydot
+            r[4] = 0.0  # zdot
+
         return r
 
     return r_of_t
@@ -632,7 +644,13 @@ def plot_results(data: Dict[str, Any], save_prefix: str = 'cps'):
     axes[0, 0].plot(R[1, :], R[3, :], 'g:', label='Reference', linewidth=2, markersize=8)
     axes[0, 0].set_xlabel('x [m]')
     axes[0, 0].set_ylabel('y [m]')
-    axes[0, 0].set_title('XY Trajectory')
+
+    # Calculate tracking error
+    xy_error = np.sqrt((X[1, :] - R[1, :]) ** 2 + (X[3, :] - R[3, :]) ** 2)
+    rms_error = np.sqrt(np.mean(xy_error ** 2))
+    max_error = np.max(xy_error)
+
+    axes[0, 0].set_title(f'XY Trajectory (RMS err: {rms_error:.3f}m, Max: {max_error:.3f}m)')
     axes[0, 0].legend()
     axes[0, 0].grid(True)
     axes[0, 0].axis('equal')
@@ -640,34 +658,46 @@ def plot_results(data: Dict[str, Any], save_prefix: str = 'cps'):
     # Altitude
     axes[0, 1].plot(t, X[5, :], 'b-', label='True z', linewidth=2)
     axes[0, 1].plot(t, R[5, :], 'g:', label='Reference z', linewidth=2)
+    z_error_rms = np.sqrt(np.mean((X[5, :] - R[5, :]) ** 2))
     axes[0, 1].set_xlabel('Time [s]')
     axes[0, 1].set_ylabel('z [m]')
-    axes[0, 1].set_title('Altitude Response')
+    axes[0, 1].set_title(f'Altitude Response (RMS err: {z_error_rms:.4f}m)')
     axes[0, 1].legend()
     axes[0, 1].grid(True)
 
     # Control Inputs
     ax = axes[1, 0]
-    ax.plot(t, U[0, :], 'b-', label='Fz', alpha=0.7)
-    ax.plot(t, U[1, :], 'r-', label='τx', alpha=0.7)
-    ax.plot(t, U[2, :], 'g-', label='τy', alpha=0.7)
-    ax.plot(t, U[3, :], 'm-', label='τz', alpha=0.7)
+    ax.plot(t, U[0, :], 'b-', label='Fz', alpha=0.7, linewidth=1)
+    ax.plot(t, U[1, :], 'r-', label='τx', alpha=0.7, linewidth=1)
+    ax.plot(t, U[2, :], 'g-', label='τy', alpha=0.7, linewidth=1)
+    ax.plot(t, U[3, :], 'm-', label='τz', alpha=0.7, linewidth=1)
+
+    # Add saturation indicators
+    ax.axhline(y=FZ_MAX, color='b', linestyle='--', alpha=0.3, linewidth=1)
+    ax.axhline(y=-FZ_MAX, color='b', linestyle='--', alpha=0.3, linewidth=1)
+    ax.axhline(y=TAU_X_MAX, color='r', linestyle='--', alpha=0.3, linewidth=1)
+    ax.axhline(y=-TAU_X_MAX, color='r', linestyle='--', alpha=0.3, linewidth=1)
+
     ax.set_xlabel('Time [s]')
     ax.set_ylabel('Control')
-    ax.set_title('Control Inputs')
+    ax.set_title('Control Inputs (dashed = limits)')
     ax.legend()
     ax.grid(True)
 
     # Euler Angles
-    axes[1, 1].plot(t, X[7, :], label='φ (roll)', linewidth=2)
-    axes[1, 1].plot(t, X[9, :], label='θ (pitch)', linewidth=2)
-    axes[1, 1].plot(t, X[11, :], label='ψ (yaw)', linewidth=2)
-    lim = math.radians(MAX_TILT_DEG)
-    axes[1, 1].axhline(y=lim, color='r', linestyle='--', alpha=0.5)
-    axes[1, 1].axhline(y=-lim, color='r', linestyle='--', alpha=0.5)
+    axes[1, 1].plot(t, np.rad2deg(X[7, :]), label='φ (roll)', linewidth=2)
+    axes[1, 1].plot(t, np.rad2deg(X[9, :]), label='θ (pitch)', linewidth=2)
+    axes[1, 1].plot(t, np.rad2deg(X[11, :]), label='ψ (yaw)', linewidth=2)
+    axes[1, 1].axhline(y=MAX_TILT_DEG, color='r', linestyle='--', alpha=0.5)
+    axes[1, 1].axhline(y=-MAX_TILT_DEG, color='r', linestyle='--', alpha=0.5)
+
+    # Calculate tilt statistics
+    roll_max = np.max(np.abs(np.rad2deg(X[7, :])))
+    pitch_max = np.max(np.abs(np.rad2deg(X[9, :])))
+
     axes[1, 1].set_xlabel('Time [s]')
-    axes[1, 1].set_ylabel('Angle [rad]')
-    axes[1, 1].set_title(f'Euler Angles (±{MAX_TILT_DEG}° guide)')
+    axes[1, 1].set_ylabel('Angle [deg]')
+    axes[1, 1].set_title(f'Euler Angles (Max roll: {roll_max:.1f}°, pitch: {pitch_max:.1f}°)')
     axes[1, 1].legend()
     axes[1, 1].grid(True)
 
@@ -675,6 +705,20 @@ def plot_results(data: Dict[str, Any], save_prefix: str = 'cps'):
     if save_prefix:
         plt.savefig(f'{save_prefix}_results.png', dpi=150, bbox_inches='tight')
     plt.show()
+
+    # Print summary
+    print(f"\n{'=' * 50}")
+    print("TRACKING PERFORMANCE SUMMARY:")
+    print(f"{'=' * 50}")
+    print(f"XY Tracking:")
+    print(f"  RMS Error: {rms_error:.4f} m")
+    print(f"  Max Error: {max_error:.4f} m")
+    print(f"Altitude Tracking:")
+    print(f"  RMS Error: {z_error_rms:.4f} m")
+    print(f"Attitude:")
+    print(f"  Max Roll:  {roll_max:.2f}° (limit: {MAX_TILT_DEG}°)")
+    print(f"  Max Pitch: {pitch_max:.2f}° (limit: {MAX_TILT_DEG}°)")
+    print(f"{'=' * 50}\n")
 
 
 # ======================================================================================
