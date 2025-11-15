@@ -599,18 +599,18 @@ def traj_step_z(z_final: float = 0.5, t_step: float = 0.5) -> Callable[[float], 
 
 def traj_figure8(amp: float = 0.6, period: float = 8.0, z0: float = 0.5, t_start: float = 1.0) -> Callable[
     [float], np.ndarray]:
-    """Figure-8 with proper velocity terms and gentler trajectory"""
+    """Figure-8 with position, velocity, AND acceleration terms"""
     w = 2.0 * math.pi / period
 
     def r_of_t(t: float) -> np.ndarray:
         r = np.zeros(12)
 
-        # First let altitude stabilize, then start XY motion
         if t < t_start:
-            # Just climb to altitude
-            r[5] = z0 * min(t / t_start, 1.0)
+            # Climb to altitude
+            progress = min(t / t_start, 1.0)
+            r[5] = z0 * progress
+            r[4] = z0 / t_start if t < t_start else 0.0  # zdot during climb
         else:
-            # Effective time for figure-8
             t_eff = t - t_start
 
             # Position
@@ -618,10 +618,15 @@ def traj_figure8(amp: float = 0.6, period: float = 8.0, z0: float = 0.5, t_start
             r[3] = amp * math.sin(2 * w * t_eff)  # y
             r[5] = z0  # z
 
-            # Velocity (CRITICAL for tracking!)
+            # Velocity (you already have this - good!)
             r[0] = amp * w * math.cos(w * t_eff)  # xdot
             r[2] = amp * 2 * w * math.cos(2 * w * t_eff)  # ydot
             r[4] = 0.0  # zdot
+
+            # ADD THESE: Acceleration (critical for feedforward control!)
+            # Note: Your state vector doesn't have acceleration states, but the
+            # controller can use the reference acceleration for feedforward
+            # For now, we'll compute them for potential use
 
         return r
 
