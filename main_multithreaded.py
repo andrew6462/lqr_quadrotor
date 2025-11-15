@@ -153,24 +153,26 @@ def load_gains(mat_dir: str = 'mat') -> Gains:
             except:
                 pass
     if K is None:
-        # More conservative default gains for better stability
         K = np.zeros((4, 12))
-        # Altitude control (strong but not aggressive)
-        K[0, 4] = 4.0;
-        K[0, 5] = 5.0
-        # Roll control (more damping)
-        K[1, 6] = 1.2;
-        K[1, 7] = 1.8;
-        K[1, 2] = 1.2;
-        K[1, 3] = 1.5
-        # Pitch control (more damping)
-        K[2, 8] = 1.2;
-        K[2, 9] = 1.8;
-        K[2, 0] = 1.2;
-        K[2, 1] = 1.5
+        # Altitude control - increase gains
+        K[0, 4] = 6.0  # zdot (was 4.0)
+        K[0, 5] = 8.0  # z (was 5.0)
+
+        # Roll control - increase for faster response
+        K[1, 6] = 2.0  # phidot (was 1.2)
+        K[1, 7] = 3.0  # phi (was 1.8)
+        K[1, 2] = 2.5  # ydot (was 1.2)
+        K[1, 3] = 3.0  # y (was 1.5)
+
+        # Pitch control - increase for faster response
+        K[2, 8] = 2.0  # thetadot (was 1.2)
+        K[2, 9] = 3.0  # theta (was 1.8)
+        K[2, 0] = 2.5  # xdot (was 1.2)
+        K[2, 1] = 3.0  # x (was 1.5)
+
         # Yaw control
-        K[3, 10] = 1.0;
-        K[3, 11] = 1.5
+        K[3, 10] = 1.5  # psidot (was 1.0)
+        K[3, 11] = 2.0  # psi (was 1.5)
         print('[info] Using improved default K gains.')
     return Gains(K=K.astype(float), Kc=(Kc.astype(float) if Kc is not None else None))
 
