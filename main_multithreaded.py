@@ -21,9 +21,9 @@ import matplotlib.pyplot as plt
 from scipy.io import loadmat
 import os
 
-# ======================================================================================
+
 # CONSTANTS
-# ======================================================================================
+
 G = 9.81
 M = 0.60
 JX, JY, JZ = 7.5e-3, 7.5e-3, 1.3e-2
@@ -35,9 +35,9 @@ MAX_TILT_DEG = 20.0
 RG_ITERS = 14
 
 
-# ======================================================================================
+
 # Data Structures
-# ======================================================================================
+
 @dataclass
 class SensorData:
     timestamp: float
@@ -63,9 +63,9 @@ class Gains:
     Kc: Optional[np.ndarray]
 
 
-# ======================================================================================
+
 # Thread-Safe Logger
-# ======================================================================================
+
 class SimulationLogger:
     def __init__(self):
         self.lock = threading.Lock()
@@ -97,9 +97,9 @@ class SimulationLogger:
             }
 
 
-# ======================================================================================
+
 # Models
-# ======================================================================================
+
 def build_linear_AB() -> Tuple[np.ndarray, np.ndarray]:
     A = np.zeros((12, 12))
     A[1, 0] = 1.0;
@@ -158,13 +158,13 @@ def load_gains(mat_dir: str = 'mat') -> Gains:
         K[0, 4] = 6.0  # zdot (was 4.0)
         K[0, 5] = 8.0  # z (was 5.0)
 
-        # Roll control - increase for faster response
+        # Roll control
         K[1, 6] = 2.0  # phidot (was 1.2)
         K[1, 7] = 3.0  # phi (was 1.8)
         K[1, 2] = 2.5  # ydot (was 1.2)
         K[1, 3] = 3.0  # y (was 1.5)
 
-        # Pitch control - increase for faster response
+        # Pitch control
         K[2, 8] = 2.0  # thetadot (was 1.2)
         K[2, 9] = 3.0  # theta (was 1.8)
         K[2, 0] = 2.5  # xdot (was 1.2)
@@ -197,9 +197,9 @@ def govern_reference(x: np.ndarray, v_prev: np.ndarray, r_target: np.ndarray,
     return v_best
 
 
-# ======================================================================================
+
 # Actuator Module
-# ======================================================================================
+
 class Actuator(threading.Thread):
     def __init__(self,
                  input_queue: queue.Queue,
@@ -231,9 +231,9 @@ class Actuator(threading.Thread):
         print(f"[{self.name}] Finished")
 
 
-# ======================================================================================
-# FIX 1: Ground Station with proper trajectory derivatives
-# ======================================================================================
+
+# Ground Station
+
 class GroundStation(threading.Thread):
     def __init__(self, traj_func: Callable[[float], np.ndarray],
                  T: float, rate_hz: float,
@@ -305,9 +305,9 @@ class GroundStation(threading.Thread):
         print(f"[{self.name}] Finished")
 
 
-# ======================================================================================
-# FIX 2: Controller with better error handling
-# ======================================================================================
+
+# Controller
+
 class Controller(threading.Thread):
     def __init__(self, gains: Gains, use_integrator: bool,
                  sensor_queue: queue.Queue,
@@ -368,9 +368,9 @@ class Controller(threading.Thread):
         print(f"[{self.name}] Finished")
 
 
-# ======================================================================================
+
 # Simulator
-# ======================================================================================
+
 class Simulator(threading.Thread):
     def __init__(self, T: float, Ts: float,
                  control_queue: queue.Queue,
@@ -420,9 +420,9 @@ class Simulator(threading.Thread):
         print(f"[{self.name}] Finished at t={self.t:.2f}s")
 
 
-# ======================================================================================
+
 # Sensor
-# ======================================================================================
+
 class Sensor(threading.Thread):
     def __init__(self, rate_hz: float, noise_std: float,
                  state_getter: Callable[[], np.ndarray],
@@ -468,9 +468,9 @@ class Sensor(threading.Thread):
         print(f"[{self.name}] Finished")
 
 
-# ======================================================================================
-# FIX 3: Improved main coordinator
-# ======================================================================================
+
+# Main coordinator
+
 def run_multithreaded_simulation(
         traj_func: Callable[[float], np.ndarray],
         T: float,
@@ -582,9 +582,9 @@ def run_multithreaded_simulation(
     return logger.get_arrays()
 
 
-# ======================================================================================
+
 # FIX 4: Improved trajectories with proper derivatives
-# ======================================================================================
+
 def traj_hover() -> Callable[[float], np.ndarray]:
     return lambda t: np.zeros(12)
 
@@ -601,7 +601,7 @@ def traj_step_z(z_final: float = 0.5, t_step: float = 0.5) -> Callable[[float], 
 
 def traj_figure8(amp: float = 0.6, period: float = 8.0, z0: float = 0.5, t_start: float = 1.0) -> Callable[
     [float], np.ndarray]:
-    """Figure-8 with position, velocity, AND acceleration terms"""
+
     w = 2.0 * math.pi / period
 
     def r_of_t(t: float) -> np.ndarray:
@@ -620,15 +620,10 @@ def traj_figure8(amp: float = 0.6, period: float = 8.0, z0: float = 0.5, t_start
             r[3] = amp * math.sin(2 * w * t_eff)  # y
             r[5] = z0  # z
 
-            # Velocity (you already have this - good!)
+            # Velocity
             r[0] = amp * w * math.cos(w * t_eff)  # xdot
             r[2] = amp * 2 * w * math.cos(2 * w * t_eff)  # ydot
             r[4] = 0.0  # zdot
-
-            # ADD THESE: Acceleration (critical for feedforward control!)
-            # Note: Your state vector doesn't have acceleration states, but the
-            # controller can use the reference acceleration for feedforward
-            # For now, we'll compute them for potential use
 
         return r
 
