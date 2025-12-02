@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "description": "CPS Drone Simulation with Cyber Attack Scenarios and Defense Mechanisms",
   "scripts": {
-    "test": "python main_multithreaded.py --traj figure8 --use-rg --T 12",
-    "baseline": "python main_multithreaded.py --traj figure8 --use-rg --T 12",
+    "test": "python main_multithreaded.py --traj figure8 --T 9",
+    "baseline": "python main_multithreaded.py --traj figure8 --T 9",
     "scenario1": "python scenario1_fdi_attack.py",
     "scenario2": "python scenario2_dos_attack.py",
     "scenario3": "python scenario3_replay_attack.py",

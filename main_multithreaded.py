@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-
+"""
+IMPROVED Multithreaded Quadrotor CPS
+Key fixes:
+1. Fixed queue synchronization issues
+2. Added proper derivative terms to trajectory
+3. Fixed reference governor integration
+4. Improved timing and data flow
+"""
 
 from __future__ import annotations
 import threading
@@ -11,13 +18,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Dict, Any, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from scipy.io import loadmat
 import os
 
-# ======================================================================================
-# CONSTANTS (same as original)
-# ======================================================================================
+
+# CONSTANTS
+
 G = 9.81
 M = 0.60
 JX, JY, JZ = 7.5e-3, 7.5e-3, 1.3e-2
@@ -28,38 +34,39 @@ TAU_Z_MAX = 0.10
 MAX_TILT_DEG = 20.0
 RG_ITERS = 14
 
-# ======================================================================================
+
+
 # Data Structures
-# ======================================================================================
+
 @dataclass
 class SensorData:
-    """Data from sensor to controller"""
     timestamp: float
-    state: np.ndarray  # 12-dim state with noise
-    true_state: np.ndarray  # Ground truth (for logging)
+    state: np.ndarray
+    true_state: np.ndarray
+
 
 @dataclass
 class ControlCommand:
-    """Control input from controller to simulator"""
     timestamp: float
-    u: np.ndarray  # 4-dim control input [Fz, tau_x, tau_y, tau_z]
+    u: np.ndarray
+
 
 @dataclass
 class TrajectoryPoint:
-    """Reference from ground station to controller"""
     timestamp: float
-    r: np.ndarray  # 12-dim reference state
+    r: np.ndarray
+
 
 @dataclass
 class Gains:
     K: np.ndarray
     Kc: Optional[np.ndarray]
 
-# ======================================================================================
+
+
 # Thread-Safe Logger
-# ======================================================================================
+
 class SimulationLogger:
-    """Thread-safe data logger for all simulation data"""
     def __init__(self):
         self.lock = threading.Lock()
         self.data = {
@@ -69,8 +76,8 @@ class SimulationLogger:
             'control': [],
             'sensor_measurement': []
         }
-    
-    def log(self, t: float, state: np.ndarray, ref: np.ndarray, 
+
+    def log(self, t: float, state: np.ndarray, ref: np.ndarray,
             u: np.ndarray, sensor: np.ndarray):
         with self.lock:
             self.data['time'].append(t)
@@ -78,7 +85,7 @@ class SimulationLogger:
             self.data['reference'].append(ref.copy())
             self.data['control'].append(u.copy())
             self.data['sensor_measurement'].append(sensor.copy())
-    
+
     def get_arrays(self):
         with self.lock:
             return {
@@ -89,20 +96,27 @@ class SimulationLogger:
                 'S': np.array(self.data['sensor_measurement']).T
             }
 
-# ======================================================================================
-# Models (same as original)
-# ======================================================================================
+
+
+# Models
+
 def build_linear_AB() -> Tuple[np.ndarray, np.ndarray]:
-    A = np.zeros((12,12))
-    A[1,0] = 1.0; A[3,2] = 1.0; A[5,4] = 1.0
-    A[7,6] = 1.0; A[9,8] = 1.0; A[11,10] = 1.0
-    A[0,9] = -G; A[2,7] = +G
-    B = np.zeros((12,4))
-    B[4,0] = -1.0 / M
-    B[6,1] = 1.0 / JX
-    B[8,2] = 1.0 / JY
-    B[10,3] = 1.0 / JZ
+    A = np.zeros((12, 12))
+    A[1, 0] = 1.0;
+    A[3, 2] = 1.0;
+    A[5, 4] = 1.0
+    A[7, 6] = 1.0;
+    A[9, 8] = 1.0;
+    A[11, 10] = 1.0
+    A[0, 9] = -G;
+    A[2, 7] = +G
+    B = np.zeros((12, 4))
+    B[4, 0] = -1.0 / M
+    B[6, 1] = 1.0 / JX
+    B[8, 2] = 1.0 / JY
+    B[10, 3] = 1.0 / JZ
     return A, B
+
 
 def f_nonlinear(x: np.ndarray, u: np.ndarray) -> np.ndarray:
     xd, x, yd, y, zd, z, phid, phi, thetad, theta, psid, psi = x
@@ -113,35 +127,55 @@ def f_nonlinear(x: np.ndarray, u: np.ndarray) -> np.ndarray:
     phidd = (tx - (JZ - JY) * thetad * psid) / JX
     thetadd = (ty - (JX - JZ) * phid * psid) / JY
     psidd = (tz - (JY - JX) * phid * thetad) / JZ
-    return np.array([xdd, xd, ydd, yd, zdd, zd, 
+    return np.array([xdd, xd, ydd, yd, zdd, zd,
                      phidd, phid, thetadd, thetad, psidd, psid], dtype=float)
 
-def rk4_step(x: np.ndarray, u: np.ndarray, 
-             f: Callable[[np.ndarray, np.ndarray], np.ndarray], 
+
+def rk4_step(x: np.ndarray, u: np.ndarray,
+             f: Callable[[np.ndarray, np.ndarray], np.ndarray],
              dt: float) -> np.ndarray:
     k1 = f(x, u)
-    k2 = f(x + 0.5*dt*k1, u)
-    k3 = f(x + 0.5*dt*k2, u)
-    k4 = f(x + dt*k3, u)
-    return x + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+    k2 = f(x + 0.5 * dt * k1, u)
+    k3 = f(x + 0.5 * dt * k2, u)
+    k4 = f(x + dt * k3, u)
+    return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
 
 def load_gains(mat_dir: str = 'mat') -> Gains:
-    K = None; Kc = None
-    for p in (os.path.join(mat_dir,'K.mat'), os.path.join(mat_dir,'control.mat')):
+    K = None;
+    Kc = None
+    for p in (os.path.join(mat_dir, 'K.mat'), os.path.join(mat_dir, 'control.mat')):
         if os.path.exists(p):
             try:
                 mat = loadmat(p)
                 if K is None and 'K' in mat: K = np.array(mat['K'], dtype=float)
                 if Kc is None and 'Kc' in mat: Kc = np.array(mat['Kc'], dtype=float)
-            except: pass
+            except:
+                pass
     if K is None:
-        K = np.zeros((4,12))
-        K[0,4] = 3.2; K[0,5] = 4.5
-        K[1,6] = 1.1; K[1,7] = 1.6; K[1,2] = 0.6; K[1,3] = 0.8
-        K[2,8] = 1.1; K[2,9] = 1.6; K[2,0] = 0.6; K[2,1] = 0.8
-        K[3,10]= 0.8; K[3,11]= 1.2
-        print('[info] Using demo K (fallback).')
+        K = np.zeros((4, 12))
+        # Altitude control - increase gains
+        K[0, 4] = 6.0  # zdot (was 4.0)
+        K[0, 5] = 8.0  # z (was 5.0)
+
+        # Roll control
+        K[1, 6] = 2.0  # phidot (was 1.2)
+        K[1, 7] = 3.0  # phi (was 1.8)
+        K[1, 2] = 2.5  # ydot (was 1.2)
+        K[1, 3] = 3.0  # y (was 1.5)
+
+        # Pitch control
+        K[2, 8] = 2.0  # thetadot (was 1.2)
+        K[2, 9] = 3.0  # theta (was 1.8)
+        K[2, 0] = 2.5  # xdot (was 1.2)
+        K[2, 1] = 3.0  # x (was 1.5)
+
+        # Yaw control
+        K[3, 10] = 1.5  # psidot (was 1.0)
+        K[3, 11] = 2.0  # psi (was 1.5)
+        print('[info] Using improved default K gains.')
     return Gains(K=K.astype(float), Kc=(Kc.astype(float) if Kc is not None else None))
+
 
 def govern_reference(x: np.ndarray, v_prev: np.ndarray, r_target: np.ndarray,
                      K: np.ndarray, u_min: np.ndarray, u_max: np.ndarray,
@@ -152,99 +186,134 @@ def govern_reference(x: np.ndarray, v_prev: np.ndarray, r_target: np.ndarray,
     lo, hi = 0.0, 1.0
     v_best = v_prev
     for _ in range(iters):
-        kappa = 0.5*(lo+hi)
-        v = v_prev + kappa*d
+        kappa = 0.5 * (lo + hi)
+        v = v_prev + kappa * d
         u = -K @ (x - v)
         if np.all(u <= u_max + 1e-9) and np.all(u >= u_min - 1e-9):
-            v_best = v; lo = kappa
+            v_best = v;
+            lo = kappa
         else:
             hi = kappa
     return v_best
 
-# ======================================================================================
-# THREAD 1: Ground Station (Trajectory Generator)
-# ======================================================================================
+
+
+# Actuator Module
+
+class Actuator(threading.Thread):
+    def __init__(self,
+                 input_queue: queue.Queue,
+                 output_queue: queue.Queue,
+                 stop_event: threading.Event,
+                 rate_hz: float = 500):
+        super().__init__(name="Actuator")
+        self.input_queue = input_queue
+        self.output_queue = output_queue
+        self.stop_event = stop_event
+        self.dt = 1.0 / rate_hz
+        self.u_max = np.array([FZ_MAX, TAU_X_MAX, TAU_Y_MAX, TAU_Z_MAX])
+        self.u_min = -self.u_max
+
+    def saturate(self, u: np.ndarray) -> np.ndarray:
+        return np.minimum(np.maximum(u, self.u_min), self.u_max)
+
+    def run(self):
+        print(f"[{self.name}] Started")
+        while not self.stop_event.is_set():
+            try:
+                cmd = self.input_queue.get(timeout=0.01)
+                u_sat = self.saturate(cmd.u)
+                actuator_cmd = ControlCommand(timestamp=cmd.timestamp, u=u_sat)
+                self.output_queue.put(actuator_cmd, timeout=0.1)
+            except queue.Empty:
+                pass
+            except queue.Full:
+                pass  # Ignore queue full errors during shutdown
+            time.sleep(self.dt)
+        print(f"[{self.name}] Finished")
+
+
+
+# Ground Station
+
 class GroundStation(threading.Thread):
-    """
-    Ground Station generates trajectory references at a fixed rate.
-    Sends TrajectoryPoint objects to the controller.
-    """
-    def __init__(self, traj_func: Callable[[float], np.ndarray], 
-                 T: float, rate_hz: float, 
-                 output_queue: queue.Queue, 
+    def __init__(self, traj_func: Callable[[float], np.ndarray],
+                 T: float, rate_hz: float,
+                 output_queue: queue.Queue,
+                 sensor_queue: queue.Queue,
+                 gains: Gains,
+                 use_rg: bool,
                  stop_event: threading.Event):
         super().__init__(name="GroundStation")
         self.traj_func = traj_func
         self.T = T
         self.dt = 1.0 / rate_hz
         self.output_queue = output_queue
+        self.sensor_queue = sensor_queue
+        self.gains = gains
+        self.use_rg = use_rg
         self.stop_event = stop_event
-        
-    def run(self):
-        print(f"[{self.name}] Started - generating trajectory at {1/self.dt:.1f} Hz")
-        t = 0.0
-        while t <= self.T and not self.stop_event.is_set():
-            r = self.traj_func(t)
-            traj_point = TrajectoryPoint(timestamp=t, r=r)
-            try:
-                self.output_queue.put(traj_point, timeout=0.1)
-            except queue.Full:
-                pass  # Skip if queue full
-            time.sleep(self.dt)
-            t += self.dt
-        print(f"[{self.name}] Finished")
+        self.v_prev = np.zeros(12)
+        self.current_state = np.zeros(12)
+        self.current_raw_ref = np.zeros(12)  # Store ungoverned reference for plotting
+        self.u_max = np.array([FZ_MAX, TAU_X_MAX, TAU_Y_MAX, TAU_Z_MAX])
+        self.u_min = -self.u_max
 
-# ======================================================================================
-# THREAD 2: Sensor (Measurement with Noise)
-# ======================================================================================
-class Sensor(threading.Thread):
-    """
-    Sensor reads true state from simulator and adds noise.
-    Sends SensorData to controller at a fixed rate.
-    """
-    def __init__(self, rate_hz: float, noise_std: float,
-                 state_getter: Callable[[], np.ndarray],
-                 output_queue: queue.Queue,
-                 stop_event: threading.Event,
-                 seed: Optional[int] = None):
-        super().__init__(name="Sensor")
-        self.rate_hz = rate_hz
-        self.dt = 1.0 / rate_hz
-        self.noise_std = noise_std
-        self.state_getter = state_getter
-        self.output_queue = output_queue
-        self.stop_event = stop_event
-        self.rng = np.random.default_rng(seed)
-        
     def run(self):
-        print(f"[{self.name}] Started - sampling at {self.rate_hz:.1f} Hz, noise σ={self.noise_std}")
-        while not self.stop_event.is_set():
-            true_state = self.state_getter()
-            noise = self.rng.normal(0.0, self.noise_std, size=12)
-            measured_state = true_state + noise
-            
-            sensor_data = SensorData(
-                timestamp=time.time(),
-                state=measured_state,
-                true_state=true_state
-            )
+        print(f"[{self.name}] Started - RG={self.use_rg}")
+        t = 0.0
+
+        while t <= self.T and not self.stop_event.is_set():
+            # Get current state (non-blocking)
             try:
-                self.output_queue.put(sensor_data, timeout=0.1)
+                sensor_data = self.sensor_queue.get_nowait()
+                self.current_state = sensor_data.state
+            except queue.Empty:
+                pass
+
+            # Generate reference
+            r_raw = self.traj_func(t)
+            self.current_raw_ref = r_raw.copy()  # Store for plotting
+
+            # Apply reference governor
+            if self.use_rg:
+                r_governed = govern_reference(
+                    x=self.current_state,
+                    v_prev=self.v_prev,
+                    r_target=r_raw,
+                    K=self.gains.K,
+                    u_min=self.u_min,
+                    u_max=self.u_max,
+                    iters=RG_ITERS
+                )
+                self.v_prev = r_governed
+            else:
+                r_governed = r_raw
+
+            # Send reference
+            traj_point = TrajectoryPoint(timestamp=t, r=r_governed)
+            try:
+                # Clear old references
+                while not self.output_queue.empty():
+                    try:
+                        self.output_queue.get_nowait()
+                    except:
+                        break
+                self.output_queue.put(traj_point, timeout=0.01)
             except queue.Full:
                 pass
+
             time.sleep(self.dt)
+            t += self.dt
+
         print(f"[{self.name}] Finished")
 
-# ======================================================================================
-# THREAD 3: Controller (Control Law Computation)
-# ======================================================================================
+
+
+# Controller
+
 class Controller(threading.Thread):
-    """
-    Controller receives sensor data and trajectory references.
-    Computes control input using LQR + reference governor.
-    Sends ControlCommand to simulator.
-    """
-    def __init__(self, gains: Gains, use_rg: bool, use_integrator: bool,
+    def __init__(self, gains: Gains, use_integrator: bool,
                  sensor_queue: queue.Queue,
                  traj_queue: queue.Queue,
                  output_queue: queue.Queue,
@@ -252,84 +321,61 @@ class Controller(threading.Thread):
                  rate_hz: float = 250):
         super().__init__(name="Controller")
         self.gains = gains
-        self.use_rg = use_rg
         self.use_integrator = use_integrator
         self.sensor_queue = sensor_queue
         self.traj_queue = traj_queue
         self.output_queue = output_queue
         self.stop_event = stop_event
         self.dt = 1.0 / rate_hz
-        
-        # State
-        self.v = np.zeros(12)  # Governed reference
-        self.xi = np.zeros(12)  # Integrator state
+        self.xi = np.zeros(12)
         self.current_ref = np.zeros(12)
         self.current_sensor = np.zeros(12)
-        
-        # Limits
-        self.u_max = np.array([FZ_MAX, TAU_X_MAX, TAU_Y_MAX, TAU_Z_MAX])
-        self.u_min = -self.u_max
-        
+
     def run(self):
-        print(f"[{self.name}] Started - control rate {1/self.dt:.1f} Hz, RG={self.use_rg}, INT={self.use_integrator}")
-        
+        print(f"[{self.name}] Started - INT={self.use_integrator}")
+
         while not self.stop_event.is_set():
-            # Get latest sensor data (non-blocking)
+            # Get latest sensor data
             try:
                 sensor_data = self.sensor_queue.get(timeout=0.01)
                 self.current_sensor = sensor_data.state
             except queue.Empty:
                 pass
-            
-            # Get latest trajectory reference (non-blocking)
+
+            # Get latest trajectory reference
             try:
                 traj_point = self.traj_queue.get(timeout=0.01)
                 self.current_ref = traj_point.r
             except queue.Empty:
                 pass
-            
+
             # Compute control
-            if self.use_rg:
-                self.v = govern_reference(
-                    self.current_sensor, self.v, self.current_ref,
-                    self.gains.K, self.u_min, self.u_max
-                )
-            else:
-                self.v = self.current_ref
-            
-            err = self.current_sensor - self.v
+            err = self.current_sensor - self.current_ref
             u = -self.gains.K @ err
-            
-            # Integrator (position errors only)
+
+            # Optional integrator
             if self.use_integrator and self.gains.Kc is not None:
                 pos_idx = [1, 3, 5]
-                epos = self.v[pos_idx] - self.current_sensor[pos_idx]
+                epos = self.current_ref[pos_idx] - self.current_sensor[pos_idx]
                 self.xi[pos_idx] += epos * self.dt
                 u = u - (self.gains.Kc @ self.xi[pos_idx])
-            
-            # Saturate
-            u_clip = np.minimum(np.maximum(u, self.u_min), self.u_max)
-            
-            # Send to simulator
-            cmd = ControlCommand(timestamp=time.time(), u=u_clip)
+
+            # Send to actuator
+            cmd = ControlCommand(timestamp=time.time(), u=u)
             try:
-                self.output_queue.put(cmd, timeout=0.1)
+                self.output_queue.put(cmd, timeout=0.01)
             except queue.Full:
                 pass
-            
+
             time.sleep(self.dt)
-        
+
         print(f"[{self.name}] Finished")
 
-# ======================================================================================
-# THREAD 4: Simulator (Plant Dynamics Integration)
-# ======================================================================================
+
+
+# Simulator
+
 class Simulator(threading.Thread):
-    """
-    Simulator integrates nonlinear dynamics.
-    Receives control commands from controller.
-    Maintains true state accessible by sensor.
-    """
     def __init__(self, T: float, Ts: float,
                  control_queue: queue.Queue,
                  logger: SimulationLogger,
@@ -341,279 +387,425 @@ class Simulator(threading.Thread):
         self.control_queue = control_queue
         self.logger = logger
         self.stop_event = stop_event
-        
-        # Dynamics
+
         if plant == 'linear':
             A, B = build_linear_AB()
             self.f = lambda x, u: A @ x + B @ u
         else:
             self.f = f_nonlinear
-        
-        # State
+
         self.state_lock = threading.Lock()
         self.x = np.zeros(12)
         self.u = np.zeros(4)
         self.t = 0.0
-        
+
     def get_state(self) -> np.ndarray:
-        """Thread-safe state access for sensor"""
         with self.state_lock:
             return self.x.copy()
-    
+
     def run(self):
-        print(f"[{self.name}] Started - integration timestep {self.Ts:.4f} s")
-        
+        print(f"[{self.name}] Started")
+
         while self.t <= self.T and not self.stop_event.is_set():
-            # Get latest control (non-blocking)
+            # Get latest control
             try:
                 cmd = self.control_queue.get(timeout=0.01)
                 self.u = cmd.u
             except queue.Empty:
-                pass  # Use previous control
-            
-            # Integrate
+                pass
+
+            # Integrate dynamics
             with self.state_lock:
                 self.x = rk4_step(self.x, self.u, self.f, self.Ts)
-            
+
             self.t += self.Ts
-            time.sleep(self.Ts)  # Real-time simulation
-        
+            time.sleep(self.Ts)
+
         print(f"[{self.name}] Finished at t={self.t:.2f}s")
 
-# ======================================================================================
-# Main Coordinator
-# ======================================================================================
+
+
+# Sensor
+
+class Sensor(threading.Thread):
+    def __init__(self, rate_hz: float, noise_std: float,
+                 state_getter: Callable[[], np.ndarray],
+                 output_queues: list,  # Multiple outputs
+                 stop_event: threading.Event,
+                 seed: Optional[int] = None):
+        super().__init__(name="Sensor")
+        self.rate_hz = rate_hz
+        self.dt = 1.0 / rate_hz
+        self.noise_std = noise_std
+        self.state_getter = state_getter
+        self.output_queues = output_queues
+        self.stop_event = stop_event
+        self.rng = np.random.default_rng(seed)
+
+    def run(self):
+        print(f"[{self.name}] Started")
+        while not self.stop_event.is_set():
+            true_state = self.state_getter()
+            noise = self.rng.normal(0.0, self.noise_std, size=12)
+            measured_state = true_state + noise
+
+            sensor_data = SensorData(
+                timestamp=time.time(),
+                state=measured_state,
+                true_state=true_state
+            )
+
+            # Send to all output queues
+            for q in self.output_queues:
+                try:
+                    # Clear old data
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except:
+                            break
+                    q.put(sensor_data, timeout=0.01)
+                except queue.Full:
+                    pass
+
+            time.sleep(self.dt)
+        print(f"[{self.name}] Finished")
+
+
+
+# Main coordinator
+
 def run_multithreaded_simulation(
-    traj_func: Callable[[float], np.ndarray],
-    T: float,
-    Ts: float,
-    gains: Gains,
-    use_rg: bool,
-    use_integrator: bool,
-    sensor_noise: float = 0.05,
-    plant: str = 'nonlinear',
-    seed: Optional[int] = 42
+        traj_func: Callable[[float], np.ndarray],
+        T: float,
+        Ts: float,
+        gains: Gains,
+        use_rg: bool,
+        use_integrator: bool,
+        sensor_noise: float = 0.0,
+        plant: str = 'nonlinear',
+        seed: Optional[int] = 42
 ) -> Dict[str, Any]:
-    """
-    Main coordinator that sets up and runs all threads.
-    """
-    print("\n" + "="*70)
-    print("MULTITHREADED FLIGHT CONTROLLER SIMULATION")
-    print("="*70)
-    
+    print("\n" + "=" * 70)
+    print("IMPROVED MULTITHREADED CPS SIMULATION")
+    print("=" * 70)
+
     # Communication queues
-    traj_to_controller = queue.Queue(maxsize=10)
-    sensor_to_controller = queue.Queue(maxsize=10)
-    controller_to_sim = queue.Queue(maxsize=10)
-    
+    traj_to_controller = queue.Queue(maxsize=1)
+    sensor_to_controller = queue.Queue(maxsize=1)
+    sensor_to_ground = queue.Queue(maxsize=1)
+    controller_to_actuator = queue.Queue(maxsize=10)
+    actuator_to_sim = queue.Queue(maxsize=1)
+
     # Shared resources
     logger = SimulationLogger()
     stop_event = threading.Event()
-    
-    # Create simulator first (so sensor can access state)
+
+    # Create modules
     simulator = Simulator(
         T=T, Ts=Ts,
-        control_queue=controller_to_sim,
+        control_queue=actuator_to_sim,
         logger=logger,
         stop_event=stop_event,
         plant=plant
     )
-    
-    # Create threads
-    ground_station = GroundStation(
-        traj_func=traj_func,
-        T=T,
-        rate_hz=50,  # 50 Hz trajectory updates
-        output_queue=traj_to_controller,
-        stop_event=stop_event
-    )
-    
+
     sensor = Sensor(
-        rate_hz=100,  # 100 Hz sensor sampling
+        rate_hz=100,
         noise_std=sensor_noise,
         state_getter=simulator.get_state,
-        output_queue=sensor_to_controller,
+        output_queues=[sensor_to_controller, sensor_to_ground],
         stop_event=stop_event,
         seed=seed
     )
-    
-    controller = Controller(
+
+    ground_station = GroundStation(
+        traj_func=traj_func,
+        T=T,
+        rate_hz=50,
+        output_queue=traj_to_controller,
+        sensor_queue=sensor_to_ground,
         gains=gains,
         use_rg=use_rg,
+        stop_event=stop_event
+    )
+
+    controller = Controller(
+        gains=gains,
         use_integrator=use_integrator,
         sensor_queue=sensor_to_controller,
         traj_queue=traj_to_controller,
-        output_queue=controller_to_sim,
+        output_queue=controller_to_actuator,
         stop_event=stop_event,
-        rate_hz=250  # 250 Hz control loop
+        rate_hz=250
     )
-    
-    # Logging thread
-    def logging_loop():
-        while not stop_event.is_set():
-            # Get current reference from ground station queue (peek)
-            try:
-                traj_point = traj_to_controller.get(timeout=0.01)
-                current_ref = traj_point.r
-                traj_to_controller.put(traj_point)  # Put it back
-            except:
-                current_ref = np.zeros(12)
-            
-            # Get sensor measurement
-            try:
-                sensor_data = sensor_to_controller.get(timeout=0.01)
-                sensor_meas = sensor_data.state
-                sensor_to_controller.put(sensor_data)
-            except:
-                sensor_meas = np.zeros(12)
-            
-            # Get control
-            try:
-                cmd = controller_to_sim.get(timeout=0.01)
-                current_u = cmd.u
-                controller_to_sim.put(cmd)
-            except:
-                current_u = np.zeros(4)
-            
-            # Log
-            logger.log(
-                t=simulator.t,
-                state=simulator.get_state(),
-                ref=current_ref,
-                u=current_u,
-                sensor=sensor_meas
-            )
-            time.sleep(Ts)
-    
-    log_thread = threading.Thread(target=logging_loop, name="Logger")
-    
-    # Start all threads
-    threads = [simulator, ground_station, sensor, controller, log_thread]
+
+    actuator = Actuator(
+        input_queue=controller_to_actuator,
+        output_queue=actuator_to_sim,
+        stop_event=stop_event,
+        rate_hz=500
+    )
+
+    # Start threads
+    threads = [simulator, sensor, ground_station, controller, actuator]
     for thread in threads:
         thread.start()
-    
-    # Wait for simulator to finish
+
+    print(f"\nAll modules running...\n")
+
+    # Improved logging with real-time position tracking
+    def logging_loop():
+        log_dt = Ts
+        last_print_time = -1.0  # Print at t=0
+        while not stop_event.is_set():
+            try:
+                current_state = simulator.get_state()
+                logger.log(
+                    t=simulator.t,
+                    state=current_state,
+                    ref=ground_station.current_raw_ref.copy(),  # Log RAW (ungoverned) reference for plotting
+                    u=simulator.u.copy(),
+                    sensor=controller.current_sensor.copy()
+                )
+
+                # Print coordinates every second
+                if simulator.t - last_print_time >= 1.0:
+                    print(f"[t={simulator.t:.1f}s] Position: X={current_state[1]:6.3f}m, Y={current_state[3]:6.3f}m, Z={current_state[5]:6.3f}m")
+                    last_print_time = simulator.t
+
+            except Exception as e:
+                print(f"[Logger] Error: {e}")
+            time.sleep(log_dt)
+
+    log_thread = threading.Thread(target=logging_loop, name="Logger", daemon=True)
+    log_thread.start()
+
+    # Wait for completion
     simulator.join()
-    
-    # Stop all other threads
     stop_event.set()
     for thread in threads[1:]:
         thread.join(timeout=2.0)
-    
-    print("\n" + "="*70)
+
+    print("\n" + "=" * 70)
     print("SIMULATION COMPLETE")
-    print("="*70 + "\n")
-    
+    print("=" * 70 + "\n")
+
     return logger.get_arrays()
 
-# ======================================================================================
-# Trajectories
-# ======================================================================================
+
+
+# FIX 4: Improved trajectories with proper derivatives
+
 def traj_hover() -> Callable[[float], np.ndarray]:
     return lambda t: np.zeros(12)
 
-def traj_step_z(z_final: float = 1.0, t_step: float = 0.5) -> Callable[[float], np.ndarray]:
+
+def traj_step_z(z_final: float = 0.5, t_step: float = 0.5) -> Callable[[float], np.ndarray]:
     def r_of_t(t: float) -> np.ndarray:
         r = np.zeros(12)
-        if t >= t_step: r[5] = z_final
+        if t >= t_step:
+            r[5] = z_final  # z position
         return r
+
     return r_of_t
 
-def traj_figure8(amp: float = 1.0, period: float = 6.0, z0: float = 0.5) -> Callable[[float], np.ndarray]:
+
+def traj_figure8(amp: float = 0.6, period: float = 8.0, z0: float = 0.5, t_start: float = 1.0) -> Callable[
+    [float], np.ndarray]:
+
     w = 2.0 * math.pi / period
+
     def r_of_t(t: float) -> np.ndarray:
         r = np.zeros(12)
-        r[1] = amp * math.sin(w * t)
-        r[3] = amp * math.sin(2*w * t)
-        r[5] = z0
+
+        if t < t_start:
+            # Climb to altitude
+            progress = min(t / t_start, 1.0)
+            r[5] = z0 * progress
+            r[4] = z0 / t_start if t < t_start else 0.0  # zdot during climb
+        else:
+            t_eff = t - t_start
+
+            # Position
+            r[1] = amp * math.sin(w * t_eff)  # x
+            r[3] = amp * math.sin(2 * w * t_eff)  # y
+            r[5] = z0  # z
+
+            # Velocity
+            r[0] = amp * w * math.cos(w * t_eff)  # xdot
+            r[2] = amp * 2 * w * math.cos(2 * w * t_eff)  # ydot
+            r[4] = 0.0  # zdot
+
         return r
+
     return r_of_t
+
 
 # ======================================================================================
 # Plotting
 # ======================================================================================
-def plot_results(data: Dict[str, Any], save_prefix: str = 'mt'):
-    """Plot simulation results"""
+def plot_results(data: Dict[str, Any], save_prefix: str = 'cps'):
+    from mpl_toolkits.mplot3d import Axes3D
+
     t = data['t']
     X = data['X']
     R = data['R']
     U = data['U']
-    S = data['S']
-    
-    # XY Trajectory
-    fig1 = plt.figure(figsize=(8, 6))
-    plt.plot(X[1,:], X[3,:], 'b-', label='True State', linewidth=2)
-    plt.plot(S[1,:], S[3,:], 'r--', alpha=0.5, label='Sensor Measurement')
-    plt.plot(R[1,:], R[3,:], 'g:', label='Reference', linewidth=2)
-    plt.xlabel('x [m]')
-    plt.ylabel('y [m]')
-    plt.title('XY Trajectory (Multithreaded Simulation)')
-    plt.legend()
-    plt.grid(True)
+
+    # Calculate tracking errors
+    xy_error = np.sqrt((X[1, :] - R[1, :]) ** 2 + (X[3, :] - R[3, :]) ** 2)
+    rms_error = np.sqrt(np.mean(xy_error ** 2))
+    max_error = np.max(xy_error)
+    z_error_rms = np.sqrt(np.mean((X[5, :] - R[5, :]) ** 2))
+    roll_max = np.max(np.abs(np.rad2deg(X[7, :])))
+    pitch_max = np.max(np.abs(np.rad2deg(X[9, :])))
+
+    # ============================================
+    # FIGURE 1: 2D Top View (XY Plane)
+    # ============================================
+    fig1 = plt.figure(figsize=(12, 10))
+    plt.plot(X[1, :], X[3, :], 'b-', label='Actual Trajectory', linewidth=3, alpha=0.8)
+    plt.plot(R[1, :], R[3, :], 'r--', label='Reference (Figure-8)', linewidth=2, alpha=0.6)
+    plt.scatter([X[1, 0]], [X[3, 0]], c='green', s=200, marker='o',
+                label='Start', zorder=5, edgecolors='black', linewidths=2)
+    plt.scatter([X[1, -1]], [X[3, -1]], c='red', s=200, marker='X',
+                label='End', zorder=5, edgecolors='black', linewidths=2)
+
+    plt.xlabel('X Position [m]', fontsize=14, fontweight='bold')
+    plt.ylabel('Y Position [m]', fontsize=14, fontweight='bold')
+    plt.title(f'Figure-8 Trajectory - Top View (XY Plane)\nMultithreaded Baseline with Sensor Noise\nRMS Error: {rms_error:.3f}m, Max Error: {max_error:.3f}m',
+              fontsize=16, fontweight='bold')
+    plt.legend(fontsize=12, loc='upper right')
+    plt.grid(True, alpha=0.3)
     plt.axis('equal')
-    if save_prefix:
-        plt.savefig(f'{save_prefix}_xy.png', dpi=150, bbox_inches='tight')
-    
-    # Altitude
-    fig2 = plt.figure(figsize=(10, 4))
-    plt.plot(t, X[5,:], 'b-', label='True z', linewidth=2)
-    plt.plot(t, S[5,:], 'r--', alpha=0.5, label='Sensor z')
-    plt.plot(t, R[5,:], 'g:', label='Reference z', linewidth=2)
-    plt.xlabel('Time [s]')
-    plt.ylabel('z [m]')
-    plt.title('Altitude Response (Multithreaded)')
-    plt.legend()
-    plt.grid(True)
-    if save_prefix:
-        plt.savefig(f'{save_prefix}_altitude.png', dpi=150, bbox_inches='tight')
-    
-    # Control Inputs
-    fig3 = plt.figure(figsize=(10, 6))
-    labels = ['Fz', 'τx', 'τy', 'τz']
-    for i in range(4):
-        plt.subplot(2, 2, i+1)
-        plt.plot(t, U[i,:], 'b-', linewidth=1.5)
-        plt.axhline(y=FZ_MAX if i==0 else TAU_X_MAX, color='r', linestyle='--', alpha=0.5)
-        plt.axhline(y=-FZ_MAX if i==0 else -TAU_X_MAX, color='r', linestyle='--', alpha=0.5)
-        plt.xlabel('Time [s]')
-        plt.ylabel(labels[i])
-        plt.grid(True)
-    plt.suptitle('Control Inputs (Multithreaded)')
     plt.tight_layout()
+
+    if save_prefix:
+        plt.savefig(f'{save_prefix}_figure8_2d.png', dpi=150, bbox_inches='tight')
+        print(f"[PLOT] Saved: {save_prefix}_figure8_2d.png")
+
+    # ============================================
+    # FIGURE 2: 3D View
+    # ============================================
+    fig2 = plt.figure(figsize=(14, 10))
+    ax = fig2.add_subplot(111, projection='3d')
+
+    ax.plot(X[1, :], X[3, :], X[5, :], 'b-', label='Actual Trajectory', linewidth=3, alpha=0.8)
+    ax.plot(R[1, :], R[3, :], R[5, :], 'r--', label='Reference (Figure-8)', linewidth=2, alpha=0.6)
+    ax.scatter([X[1, 0]], [X[3, 0]], [X[5, 0]], c='green', s=150, marker='o',
+               label='Start', zorder=5, edgecolors='black', linewidths=2)
+    ax.scatter([X[1, -1]], [X[3, -1]], [X[5, -1]], c='red', s=150, marker='X',
+               label='End', zorder=5, edgecolors='black', linewidths=2)
+
+    ax.set_xlabel('X Position [m]', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Y Position [m]', fontsize=13, fontweight='bold')
+    ax.set_zlabel('Z Position [m]', fontsize=13, fontweight='bold')
+    ax.set_title(f'Figure-8 Trajectory - 3D View\nMultithreaded Baseline with Sensor Noise',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=11, loc='upper left')
+    ax.grid(True, alpha=0.3)
+    ax.view_init(elev=25, azim=45)
+    plt.tight_layout()
+
+    if save_prefix:
+        plt.savefig(f'{save_prefix}_figure8_3d.png', dpi=150, bbox_inches='tight')
+        print(f"[PLOT] Saved: {save_prefix}_figure8_3d.png")
+
+    # ============================================
+    # FIGURE 3: Position Tracking Over Time
+    # ============================================
+    fig3, axes = plt.subplots(3, 1, figsize=(14, 9))
+    positions = ['X', 'Y', 'Z']
+    indices = [1, 3, 5]
+
+    for i, (pos, idx) in enumerate(zip(positions, indices)):
+        axes[i].plot(t, X[idx, :], 'b-', linewidth=2, label='Actual')
+        axes[i].plot(t, R[idx, :], 'r--', linewidth=2, alpha=0.7, label='Reference')
+        axes[i].set_ylabel(f'{pos} Position [m]', fontsize=12, fontweight='bold')
+        axes[i].legend(fontsize=10, loc='upper right')
+        axes[i].grid(True, alpha=0.3)
+
+    axes[0].set_title('Position Tracking Over Time - Multithreaded Baseline with Sensor Noise',
+                      fontsize=13, fontweight='bold')
+    axes[2].set_xlabel('Time [s]', fontsize=12, fontweight='bold')
+    plt.tight_layout()
+
+    if save_prefix:
+        plt.savefig(f'{save_prefix}_positions.png', dpi=150, bbox_inches='tight')
+        print(f"[PLOT] Saved: {save_prefix}_positions.png")
+
+    # ============================================
+    # FIGURE 4: Control Inputs
+    # ============================================
+    fig4 = plt.figure(figsize=(14, 8))
+    labels = ['Thrust (Fz)', 'Roll Torque (τx)', 'Pitch Torque (τy)', 'Yaw Torque (τz)']
+    limits = [FZ_MAX, TAU_X_MAX, TAU_Y_MAX, TAU_Z_MAX]
+
+    for i in range(4):
+        plt.subplot(2, 2, i + 1)
+        plt.plot(t, U[i, :], 'b-', linewidth=1.5)
+        plt.axhline(y=limits[i], color='r', linestyle='--', alpha=0.5, label='Limits')
+        plt.axhline(y=-limits[i], color='r', linestyle='--', alpha=0.5)
+        plt.xlabel('Time [s]', fontsize=11)
+        plt.ylabel(labels[i], fontsize=11)
+        plt.title(labels[i], fontsize=11, fontweight='bold')
+        plt.grid(True, alpha=0.3)
+        if i == 0:
+            plt.legend(fontsize=9)
+
+    plt.suptitle('Control Inputs - Multithreaded Baseline with Sensor Noise',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+
     if save_prefix:
         plt.savefig(f'{save_prefix}_controls.png', dpi=150, bbox_inches='tight')
-    
+        print(f"[PLOT] Saved: {save_prefix}_controls.png")
+
+    print("\n[OK] All plots generated!\n")
     plt.show()
+
+    # Print summary
+    print(f"\n{'=' * 50}")
+    print("TRACKING PERFORMANCE SUMMARY:")
+    print(f"{'=' * 50}")
+    print(f"XY Tracking:")
+    print(f"  RMS Error: {rms_error:.4f} m")
+    print(f"  Max Error: {max_error:.4f} m")
+    print(f"Altitude Tracking:")
+    print(f"  RMS Error: {z_error_rms:.4f} m")
+    print(f"Attitude:")
+    print(f"  Max Roll:  {roll_max:.2f}° (limit: {MAX_TILT_DEG}°)")
+    print(f"  Max Pitch: {pitch_max:.2f}° (limit: {MAX_TILT_DEG}°)")
+    print(f"{'=' * 50}\n")
+
 
 # ======================================================================================
 # CLI
 # ======================================================================================
 def main():
-    ap = argparse.ArgumentParser(description='Multithreaded Quadrotor Flight Controller (HW3)')
-    ap.add_argument('--traj', choices=['hover','step_z','figure8'], default='figure8')
-    ap.add_argument('--T', type=float, default=6.0)
-    ap.add_argument('--Ts', type=float, default=0.008)
-    ap.add_argument('--use-rg', action='store_true')
-    ap.add_argument('--use-integrator', action='store_true')
-    ap.add_argument('--sensor-noise', type=float, default=0.05)
-    ap.add_argument('--plant', choices=['linear','nonlinear'], default='nonlinear')
+    ap = argparse.ArgumentParser(description='Improved Multithreaded Quadrotor CPS')
+    ap.add_argument('--traj', choices=['hover', 'step_z', 'figure8'], default='figure8')
+    ap.add_argument('--T', type=float, default=10.0)
+    ap.add_argument('--Ts', type=float, default=0.01)
+    ap.add_argument('--use-rg', action='store_true', help='Enable reference governor')
+    ap.add_argument('--use-integrator', action='store_true', help='Enable integral control')
+    ap.add_argument('--sensor-noise', type=float, default=0.05, help='Sensor noise std dev (default: 0.05)')
+    ap.add_argument('--plant', choices=['linear', 'nonlinear'], default='nonlinear')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--mat-dir', type=str, default='mat')
-    ap.add_argument('--save-prefix', type=str, default='hw3_mt')
+    ap.add_argument('--save-prefix', type=str, default='cps_improved')
     args = ap.parse_args()
-    
-    # Load gains
+
     gains = load_gains(args.mat_dir)
-    
-    # Select trajectory
+
     if args.traj == 'hover':
         traj_func = traj_hover()
     elif args.traj == 'step_z':
         traj_func = traj_step_z()
     else:
         traj_func = traj_figure8()
-    
-    # Run simulation
+
     data = run_multithreaded_simulation(
         traj_func=traj_func,
         T=args.T,
@@ -625,9 +817,9 @@ def main():
         plant=args.plant,
         seed=args.seed
     )
-    
-    # Plot results
+
     plot_results(data, save_prefix=args.save_prefix)
+
 
 if __name__ == '__main__':
     main()

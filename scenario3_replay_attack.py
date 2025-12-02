@@ -1,570 +1,702 @@
 """
 SCENARIO 3: REPLAY ATTACK WITH REFERENCE GOVERNOR DEFENSE
 
-npm run scenario3
+Attack: Stuxnet-style replay attack (record → replay + malicious control injection)
+Defense: Reference Governor (safety-critical control override)
 
+npm run scenario3
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-import scipy.io as sci
+import threading
+import queue
+import time
 import math
+from typing import Dict, Any
 from collections import deque
 
-# Import from existing code
-from main_cps import load_matrix_K, quadrotor_u, figure8
+# Import multithreaded components
+from main_multithreaded import (
+    Sensor, SensorData, ControlCommand, Simulator, Controller, GroundStation, Actuator,
+    SimulationLogger, Gains, load_gains, traj_figure8, govern_reference,
+    f_nonlinear, rk4_step,
+    FZ_MAX, TAU_X_MAX, TAU_Y_MAX, TAU_Z_MAX, RG_ITERS
+)
 
 
 # =====================================================
-# ============   REPLAY ATTACK   ======================
+# REPLAY ATTACK - Actuator with Recording & Replay
 # =====================================================
 
-class ReplayAttack:
+class ReplayAttack_Actuator(threading.Thread):
     """
-    Stuxnet-Style Replay Attack
-    Phase 1: Record normal sensor data
-    Phase 2: Replay old data + inject malicious actuator commands
+    Actuator with Stuxnet-style Replay Attack
+    Phase 1: Record normal control commands
+    Phase 2: Replay old commands + inject malicious control
     """
-    def __init__(self, record_start=5.0, record_duration=5.0,
-                 replay_start=15.0, replay_duration=12.0, 
-                 attack_intensity='aggressive'):
-        self.name = "Replay_Attack"
+    def __init__(self, record_start=2.0, record_duration=3.0,
+                 replay_start=7.0, replay_duration=3.0,
+                 injection_magnitude=1.5,
+                 rate_hz=500, input_queue=None, output_queue=None, stop_event=None):
+        super().__init__(name="Actuator")
+        self.daemon = True
+
+        # Attack parameters
         self.record_start = record_start
         self.record_duration = record_duration
+        self.record_end = record_start + record_duration
         self.replay_start = replay_start
         self.replay_duration = replay_duration
-        self.attack_intensity = attack_intensity
-        
-        # Recording phase
-        self.recorded_measurements = []
+        self.replay_end = replay_start + replay_duration
+        self.injection_magnitude = injection_magnitude
+
+        # Actuator parameters
+        self.rate_hz = rate_hz
+        self.dt = 1.0 / rate_hz
+        self.input_queue = input_queue
+        self.output_queue = output_queue
+        self.stop_event = stop_event
+
+        # Recording buffer
+        self.recorded_commands = []
         self.replay_index = 0
-        
+
         # Phase tracking
-        self.phase = "idle"  # idle, recording, replay
-        self.malicious_injection_count = 0
-        
-    def compute_malicious_control(self, t, normal_control):
+        self.phase = "idle"
+        self.malicious_count = 0
+
+        # Control limits
+        self.u_max = np.array([FZ_MAX, TAU_X_MAX, TAU_Y_MAX, TAU_Z_MAX])
+        self.u_min = -self.u_max
+
+    def saturate(self, u):
+        """Apply control saturation"""
+        u_sat = np.clip(u, self.u_min, self.u_max)
+        return u_sat
+
+    def generate_malicious_control(self, normal_u, t):
         """
-        Generate malicious control commands to crash or deviate drone
+        Generate malicious control commands
+        Inject false data to deviate trajectory
         """
         t_attack = t - self.replay_start
-        ramp = min(t_attack / 2.0, 1.0)  # Ramp up over 2 seconds
-        
-        malicious_u = normal_control.copy()
-        
-        if self.attack_intensity == 'aggressive':
-            # Try to flip drone and crash
-            malicious_u[0] = -5.0 * ramp  # Negative thrust (drop)
-            malicious_u[1] = 6.0 * ramp * math.sin(2 * math.pi * t / 2)  # Roll torque
-            malicious_u[2] = 6.0 * ramp * math.cos(2 * math.pi * t / 2)  # Pitch torque
-            malicious_u[3] = 3.0 * ramp * math.sin(math.pi * t)  # Yaw torque
-            
-        elif self.attack_intensity == 'moderate':
-            # Try to deviate trajectory significantly
-            malicious_u[0] += -2.0 * ramp  # Reduce thrust
-            malicious_u[1] += 3.0 * ramp * math.sin(2 * math.pi * t / 3)
-            malicious_u[2] += 3.0 * ramp * math.cos(2 * math.pi * t / 3)
-            
-        elif self.attack_intensity == 'subtle':
-            # Subtle deviation (harder to detect)
-            malicious_u[0] += -1.0 * ramp
-            malicious_u[1] += 1.5 * ramp * math.sin(math.pi * t)
-            malicious_u[2] += 1.5 * ramp * math.cos(math.pi * t)
-        
-        self.malicious_injection_count += 1
+        ramp = min(t_attack / 1.0, 1.0)  # Ramp up over 1 second
+
+        malicious_u = normal_u.copy()
+
+        # Inject aggressive commands to deviate drone
+        malicious_u[0] += -3.0 * ramp * self.injection_magnitude  # Reduce thrust
+        malicious_u[1] += 4.0 * ramp * self.injection_magnitude * math.sin(2 * math.pi * t / 2)  # Roll
+        malicious_u[2] += 4.0 * ramp * self.injection_magnitude * math.cos(2 * math.pi * t / 2)  # Pitch
+        malicious_u[3] += 2.0 * ramp * self.injection_magnitude * math.sin(math.pi * t)  # Yaw
+
+        self.malicious_count += 1
         return malicious_u
-        
-    def update(self, t, true_measurement, normal_control):
-        """
-        Execute replay attack phases
-        Returns: (sensor_output, control_to_plant, phase_info)
-        """
-        record_end = self.record_start + self.record_duration
-        replay_end = self.replay_start + self.replay_duration
-        
-        # Phase 1: Recording
-        if self.record_start <= t <= record_end:
-            if self.phase != "recording":
-                self.phase = "recording"
-                print(f"\n[REC] [REPLAY ATTACK - PHASE 1: RECORDING] t={t:.2f}s")
-                print(f"   Eavesdropping on sensor measurements...")
-            
-            self.recorded_measurements.append(true_measurement.copy())
-            return true_measurement, normal_control, "recording"
-        
-        # Phase 2: Replay + Malicious Control Injection
-        elif self.replay_start <= t <= replay_end:
-            if self.phase != "replay":
-                self.phase = "replay"
-                print(f"\n[REPLAY] [REPLAY ATTACK - PHASE 2: REPLAY + FDI] t={t:.2f}s")
-                print(f"   Replaying {len(self.recorded_measurements)} recorded measurements")
-                print(f"   Injecting malicious control commands ({self.attack_intensity})...")
-            
-            if len(self.recorded_measurements) > 0:
-                # Replay old sensor data to controller (make it think everything is fine)
-                replayed_measurement = self.recorded_measurements[
-                    self.replay_index % len(self.recorded_measurements)
-                ]
-                self.replay_index += 1
-                
-                # Inject malicious control commands
-                malicious_control = self.compute_malicious_control(t, normal_control)
-                
-                # Controller sees replayed (old) data, but malicious commands go to plant
-                return replayed_measurement, malicious_control, "replay"
-        
-        # Normal operation
-        else:
-            if self.phase != "idle":
-                if self.phase == "replay":
-                    print(f"\n[END] [REPLAY ATTACK ENDED] t={t:.2f}s")
-                    print(f"   Total malicious commands injected: {self.malicious_injection_count}")
-                self.phase = "idle"
-            return true_measurement, normal_control, "idle"
-        
-        return true_measurement, normal_control, self.phase
-    
-    def is_active(self, t):
-        replay_end = self.replay_start + self.replay_duration
-        return self.replay_start <= t <= replay_end
+
+    def run(self):
+        print(f"[{self.name}] Started")
+        print(f"   Replay Attack: Recording={self.record_start}-{self.record_end}s, Replay={self.replay_start}-{self.replay_end}s")
+
+        cmd_count = 0
+        last_status_time = -999.0
+
+        while not self.stop_event.is_set():
+            try:
+                cmd = self.input_queue.get(timeout=0.01)
+                cmd_count += 1
+
+                # Use command timestamp for phase detection (NOT self.t)
+                t = cmd.timestamp
+
+                # Debug: Print status every 2 seconds
+                if t - last_status_time >= 2.0:
+                    print(f"[ACTUATOR] t={t:.2f}s, received {cmd_count} commands total")
+                    last_status_time = t
+
+                # Phase 1: Recording normal commands
+                if self.record_start <= t <= self.record_end:
+                    if self.phase != "recording":
+                        self.phase = "recording"
+                        print(f"\n[REC] [REPLAY ATTACK - PHASE 1: RECORDING] t={t:.2f}s")
+                        print(f"   Eavesdropping on control commands...")
+
+                    # Record the command
+                    self.recorded_commands.append(cmd.u.copy())
+
+                    # Pass through normal control
+                    u_sat = self.saturate(cmd.u)
+                    actuator_cmd = ControlCommand(timestamp=cmd.timestamp, u=u_sat)
+                    self.output_queue.put(actuator_cmd, timeout=0.1)
+
+                # Phase 2: Replay + Malicious Injection
+                elif self.replay_start <= t <= self.replay_end:
+                    if self.phase != "replay":
+                        self.phase = "replay"
+                        print(f"\n[REPLAY] [REPLAY ATTACK - PHASE 2: REPLAY + MALICIOUS INJECTION] t={t:.2f}s")
+                        print(f"   Replaying {len(self.recorded_commands)} recorded commands")
+                        print(f"   Injecting malicious control (magnitude={self.injection_magnitude})...")
+
+                    if len(self.recorded_commands) > 0:
+                        # Get replayed command (loop through recorded buffer)
+                        replayed_u = self.recorded_commands[self.replay_index % len(self.recorded_commands)]
+                        self.replay_index += 1
+
+                        # Inject malicious control on top of replayed command
+                        malicious_u = self.generate_malicious_control(replayed_u, t)
+
+                        # Apply saturation and send to plant
+                        u_sat = self.saturate(malicious_u)
+                        actuator_cmd = ControlCommand(timestamp=cmd.timestamp, u=u_sat)
+                        self.output_queue.put(actuator_cmd, timeout=0.1)
+                    else:
+                        # Fallback if no recorded commands
+                        u_sat = self.saturate(cmd.u)
+                        actuator_cmd = ControlCommand(timestamp=cmd.timestamp, u=u_sat)
+                        self.output_queue.put(actuator_cmd, timeout=0.1)
+
+                # Normal operation (idle)
+                else:
+                    if self.phase == "replay":
+                        print(f"\n[END] [REPLAY ATTACK ENDED] t={t:.2f}s")
+                        print(f"   Total malicious commands injected: {self.malicious_count}")
+                        self.phase = "idle"
+
+                    # Pass through normal control
+                    u_sat = self.saturate(cmd.u)
+                    actuator_cmd = ControlCommand(timestamp=cmd.timestamp, u=u_sat)
+                    self.output_queue.put(actuator_cmd, timeout=0.1)
+
+            except queue.Empty:
+                pass
+            except queue.Full:
+                pass  # Ignore queue full errors during shutdown
+
+            time.sleep(self.dt)
+
+        print(f"[{self.name}] Finished")
 
 
 # =====================================================
-# ============   REFERENCE GOVERNOR   =================
+# CONTROLLER WITH SIMULATION TIME - For Replay Attack
 # =====================================================
 
-class SafetyReferenceGovernor:
+class SimTimeController(Controller):
+    """Controller that uses simulation time for timestamps instead of wall clock time"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.start_time = None  # Will be set on first loop
+
+    def run(self):
+        print(f"[{self.name}] Started - INT={self.use_integrator}")
+
+        while not self.stop_event.is_set():
+            # Initialize start time on first loop
+            if self.start_time is None:
+                self.start_time = time.time()
+
+            # Calculate simulation time from elapsed wall-clock time
+            sim_time = time.time() - self.start_time
+
+            # Get latest sensor data
+            try:
+                sensor_data = self.sensor_queue.get(timeout=0.01)
+                self.current_sensor = sensor_data.state
+            except queue.Empty:
+                pass
+
+            # Get latest trajectory reference
+            try:
+                traj_point = self.traj_queue.get(timeout=0.01)
+                self.current_ref = traj_point.r
+            except queue.Empty:
+                pass
+
+            # Compute control
+            err = self.current_sensor - self.current_ref
+            u = -self.gains.K @ err
+
+            # Optional integrator
+            if self.use_integrator and self.gains.Kc is not None:
+                pos_idx = [1, 3, 5]
+                epos = self.current_ref[pos_idx] - self.current_sensor[pos_idx]
+                self.xi[pos_idx] += epos * self.dt
+                u = u - (self.gains.Kc @ self.xi[pos_idx])
+
+            # Send to actuator with SIMULATION TIME (elapsed wall-clock time)
+            cmd = ControlCommand(timestamp=sim_time, u=u)
+            try:
+                self.output_queue.put(cmd, timeout=0.01)
+            except queue.Full:
+                pass
+
+            time.sleep(self.dt)
+
+        print(f"[{self.name}] Finished")
+
+
+# =====================================================
+# REFERENCE GOVERNOR DEFENSE - Ground Station with RG
+# =====================================================
+
+class RG_GroundStation(GroundStation):
     """
-    Reference Governor for Safety-Critical Control
-    Monitors control commands and state for safety violations
-    Overrides malicious commands with safe alternatives
+    Ground Station with Safety-Based Reference Governor
+    Monitors state for unsafe conditions and corrects trajectory
     """
-    def __init__(self, K, max_tilt_deg=30, min_altitude=0.3, 
-                 max_velocity=15.0, max_control_magnitude=12.0):
-        self.K = K
+    def __init__(self, traj_func, T, gains, rate_hz=50,
+                 sensor_queue=None, output_queue=None, stop_event=None,
+                 max_tilt_deg=30, min_altitude=0.2, max_velocity=15.0, max_accel=20.0):
+        # Initialize WITHOUT RG (we'll implement our own)
+        super().__init__(
+            traj_func=traj_func,
+            T=T,
+            rate_hz=rate_hz,
+            output_queue=output_queue,
+            sensor_queue=sensor_queue,
+            gains=gains,
+            use_rg=False,  # Disable baseline RG, use custom safety-based RG
+            stop_event=stop_event
+        )
+
+        # Safety thresholds for RG
         self.max_tilt = math.radians(max_tilt_deg)
         self.min_altitude = min_altitude
         self.max_velocity = max_velocity
-        self.max_control_magnitude = max_control_magnitude
-        
-        # Lyapunov matrix for safety regions
-        self.P = np.eye(12)
-        self.safety_threshold = 25.0
-        
-        # Governor state
-        self.governed_ref = np.zeros(12)
-        self.intervention_active = False
+        self.max_accel = max_accel
+
+        # Track RG interventions
+        self.rg_log = []
         self.intervention_count = 0
-        self.intervention_times = []
-        self.blocked_commands = 0
-        
-        # Safety violation tracking
-        self.safety_violations = {
-            'tilt': [],
-            'altitude': [],
-            'velocity': [],
-            'control': []
-        }
-    
-    def check_control_safety(self, control, t):
-        """
-        Check if control command is safe
-        Returns: (is_safe, violation_type)
-        """
-        # Check control magnitude (detect malicious large commands)
-        control_magnitude = np.linalg.norm(control)
-        if control_magnitude > self.max_control_magnitude:
-            self.safety_violations['control'].append(t)
-            return False, 'control_magnitude'
-        
-        # Check individual control limits
-        if abs(control[0]) > 15:  # Thrust
-            self.safety_violations['control'].append(t)
-            return False, 'thrust_limit'
-        if abs(control[1]) > 10 or abs(control[2]) > 10:  # Torques
-            self.safety_violations['control'].append(t)
-            return False, 'torque_limit'
-        
-        return True, None
-    
-    def check_state_safety(self, state, t):
-        """
-        Check if state violates safety constraints
-        Returns: (is_safe, violation_type)
-        """
-        # Extract state components
-        phi, theta = state[7], state[9]  # Roll, pitch
-        z = state[5]  # Altitude
-        u, v, w = state[0], state[2], state[4]  # Velocities
-        
-        # Check tilt angle
-        tilt_magnitude = math.sqrt(phi**2 + theta**2)
-        if tilt_magnitude > self.max_tilt:
-            self.safety_violations['tilt'].append(t)
-            return False, 'tilt'
-        
-        # Check altitude
-        if z < self.min_altitude:
-            self.safety_violations['altitude'].append(t)
-            return False, 'altitude'
-        
-        # Check velocity
-        velocity_magnitude = math.sqrt(u**2 + v**2 + w**2)
-        if velocity_magnitude > self.max_velocity:
-            self.safety_violations['velocity'].append(t)
-            return False, 'velocity'
-        
-        return True, None
-    
-    def govern_control(self, t, state, desired_ref, proposed_control):
-        """
-        Monitor and override control commands if unsafe
-        Reference Governor's main safety check
-        """
-        # Check if proposed control is safe
-        control_safe, control_violation = self.check_control_safety(proposed_control, t)
-        
-        # Check if state is safe
-        state_safe, state_violation = self.check_state_safety(state, t)
-        
-        # Compute Lyapunov function for overall system safety
-        error = state - desired_ref
-        V = error.T @ self.P @ error
-        
-        # Determine if intervention is needed
-        needs_intervention = (not control_safe) or (not state_safe) or (V > self.safety_threshold)
-        
-        if needs_intervention:
-            if not self.intervention_active:
-                self.intervention_active = True
-                self.intervention_count += 1
-                self.intervention_times.append(t)
-                reason = control_violation if not control_safe else (state_violation if not state_safe else "Lyapunov")
-                print(f"\n[RG!] [REFERENCE GOVERNOR INTERVENTION #{self.intervention_count}] t={t:.2f}s")
-                print(f"    Reason: {reason}")
-                print(f"    Blocking malicious command, V={V:.2f}")
-                
-            self.blocked_commands += 1
-            
-            # Compute safe reference and control
-            safe_ref = self.find_safe_reference(state, desired_ref)
-            safe_control = self.compute_safe_control(state, safe_ref, proposed_control)
-            self.governed_ref = safe_ref
-            
-            return safe_control, safe_ref, True
-        else:
-            # Control and state are safe
-            if self.intervention_active:
-                self.intervention_active = False
-                print(f"[RG-OK] [REFERENCE GOVERNOR RELEASE #{self.intervention_count}] t={t:.2f}s")
-                print(f"   System stabilized, returning to normal operation")
-            
-            self.governed_ref = desired_ref
-            return proposed_control, desired_ref, False
-    
-    def find_safe_reference(self, current_state, desired_ref):
-        """
-        Find safe intermediate reference using binary search
-        Maximizes progress toward desired while maintaining safety
-        """
-        safe_ref = self.governed_ref.copy()
-        
-        # Binary search for maximum safe step
-        alpha_min, alpha_max = 0.0, 1.0
-        for _ in range(10):
-            alpha = (alpha_min + alpha_max) / 2.0
-            candidate_ref = safe_ref + alpha * (desired_ref - safe_ref)
-            
-            # Test safety
-            error = current_state - candidate_ref
-            V_test = error.T @ self.P @ error
-            
-            # Check reference itself is safe
-            if V_test < self.safety_threshold * 0.7 and candidate_ref[5] > self.min_altitude:
-                alpha_min = alpha
-            else:
-                alpha_max = alpha
-        
-        return safe_ref + alpha_min * (desired_ref - safe_ref)
-    
-    def compute_safe_control(self, state, safe_ref, proposed_control):
-        """
-        Compute safe control that respects limits
-        """
-        # Use LQR control with safe reference
-        safe_control = -self.K @ (state - safe_ref)
-        
-        # Clip to safe limits
-        safe_control[0] = np.clip(safe_control[0], -10, 15)  # Thrust
-        safe_control[1] = np.clip(safe_control[1], -8, 8)    # Roll torque
-        safe_control[2] = np.clip(safe_control[2], -8, 8)    # Pitch torque
-        safe_control[3] = np.clip(safe_control[3], -5, 5)    # Yaw torque
-        
-        return safe_control
+        self.intervention_active = False
 
+        # Previous state for derivative calculation
+        self.prev_state = np.zeros(12)
+        self.prev_time = 0.0
 
-# =====================================================
-# ============   SIMULATION   =========================
-# =====================================================
+    def check_safety(self, state):
+        """Check if current state violates safety constraints"""
+        violations = []
 
-def run_replay_with_rg_simulation():
-    """
-    Scenario 3: Replay Attack with Reference Governor Defense
-    """
-    print("\n" + "="*80)
-    print("SCENARIO 3: REPLAY ATTACK WITH REFERENCE GOVERNOR DEFENSE")
-    print("="*80)
-    print("Attack: Two-phase replay (record → replay + malicious control injection)")
-    print("Defense: Reference Governor (safety-critical control override)")
-    print("="*80)
-    
-    # Load controller
-    K = load_matrix_K("mat/K.mat")
-    
-    # Simulation parameters
-    Ts = 0.01
-    T = 40
-    tt = np.arange(0, T+Ts, Ts)
-    Ns = tt.size
-    n = 12
-    
-    # Initialize attack and defense
-    attack = ReplayAttack(record_start=5.0, record_duration=5.0,
-                         replay_start=15.0, replay_duration=10.0,
-                         attack_intensity='aggressive')
-    governor = SafetyReferenceGovernor(K, max_tilt_deg=25, min_altitude=0.3,
-                                       max_velocity=12.0, max_control_magnitude=10.0)
-    
-    print(f"\n[ATTACK] {attack.name}")
-    print(f"   Phase 1 (Recording): {attack.record_start}s - {attack.record_start + attack.record_duration}s")
-    print(f"   Phase 2 (Replay+Inject): {attack.replay_start}s - {attack.replay_start + attack.replay_duration}s")
-    print(f"   Intensity: {attack.attack_intensity}")
-    print(f"\n[DEFENSE] Reference Governor")
-    print(f"   Max tilt: {math.degrees(governor.max_tilt):.1f} degrees")
-    print(f"   Min altitude: {governor.min_altitude}m")
-    print(f"   Max control magnitude: {governor.max_control_magnitude}")
-    
-    # Storage arrays
-    x = np.zeros(n)
-    
-    states = np.zeros((Ns, n))
-    references = np.zeros((Ns, n))
-    governed_refs = np.zeros((Ns, n))
-    proposed_controls = np.zeros((Ns, 4))
-    actual_controls = np.zeros((Ns, 4))
-    safety_metrics = np.zeros((Ns, 4))  # tilt, altitude, velocity, control_mag
-    governor_flags = np.zeros(Ns)
-    recording_flags = np.zeros(Ns)
-    replay_flags = np.zeros(Ns)
-    
-    # Initialize
-    governor.governed_ref = np.zeros(n)
-    
-    print("\n" + "="*80)
-    print("Starting simulation...")
-    
-    for j, t in enumerate(tt):
-        # Generate desired reference (figure-8)
-        x_ref = np.zeros(n)
-        xr, yr, zr = figure8(t)
-        x_ref[1], x_ref[3], x_ref[5] = xr, yr, zr
-        
-        # Compute normal LQR control based on current state
-        normal_u = -K @ (x - x_ref)
-        
-        # Attack executes (may replay sensors and inject malicious control)
-        x_sensor, proposed_u, phase = attack.update(t, x, normal_u)
-        
-        # REFERENCE GOVERNOR: Check safety and override if necessary
-        safe_u, governed_ref, intervention = governor.govern_control(
-            t, x, x_ref, proposed_u
-        )
-        
-        # Apply safe control to plant
-        x_dot = quadrotor_u(x, safe_u)
-        x = x + x_dot * Ts
-        
-        # Compute safety metrics
-        phi, theta = x[7], x[9]
+        # Check tilt (roll and pitch)
+        phi, theta = state[7], state[9]
         tilt = math.sqrt(phi**2 + theta**2)
-        altitude = x[5]
-        velocity = math.sqrt(x[0]**2 + x[2]**2 + x[4]**2)
-        control_mag = np.linalg.norm(safe_u)
-        
-        # Store data
-        states[j] = x
-        references[j] = x_ref
-        governed_refs[j] = governed_ref
-        proposed_controls[j] = proposed_u
-        actual_controls[j] = safe_u
-        safety_metrics[j] = [math.degrees(tilt), altitude, velocity, control_mag]
-        governor_flags[j] = 1 if intervention else 0
-        recording_flags[j] = 1 if phase == "recording" else 0
-        replay_flags[j] = 1 if phase == "replay" else 0
-    
+        if abs(tilt) > self.max_tilt:
+            violations.append(f"tilt={math.degrees(tilt):.1f}deg")
+
+        # Check altitude
+        z = state[5]
+        if z < self.min_altitude:
+            violations.append(f"altitude={z:.2f}m")
+
+        # Check velocity magnitude
+        vel = math.sqrt(state[0]**2 + state[2]**2 + state[4]**2)
+        if vel > self.max_velocity:
+            violations.append(f"velocity={vel:.2f}m/s")
+
+        return violations
+
+    def safe_reference(self, current_state, desired_ref, dt):
+        """Generate a safe reference that gradually approaches desired while maintaining safety"""
+        # Blend between current state and desired reference
+        # Use smaller blend factor to slow down aggressive reference changes
+        blend = 0.3  # 30% toward desired per timestep
+
+        safe_ref = current_state.copy()
+
+        # Gradually approach desired positions (not velocities)
+        safe_ref[1] = current_state[1] + blend * (desired_ref[1] - current_state[1])  # x
+        safe_ref[3] = current_state[3] + blend * (desired_ref[3] - current_state[3])  # y
+        safe_ref[5] = max(current_state[5] + blend * (desired_ref[5] - current_state[5]), self.min_altitude)  # z
+
+        # Keep velocities reasonable (don't follow desired velocities during attack)
+        safe_ref[0] = desired_ref[0] * 0.5  # xdot
+        safe_ref[2] = desired_ref[2] * 0.5  # ydot
+        safe_ref[4] = desired_ref[4] * 0.5  # zdot
+
+        # Zero out angular references for stability
+        safe_ref[6:12] = 0.0
+
+        return safe_ref
+
+    def run(self):
+        """Run with safety-based Reference Governor"""
+        print(f"[{self.name}] Started - RG=True (Safety-Based Reference Governor ACTIVE)")
+        t = 0.0
+
+        while t <= self.T and not self.stop_event.is_set():
+            # Get current state
+            try:
+                sensor_data = self.sensor_queue.get_nowait()
+                self.current_state = sensor_data.state
+            except queue.Empty:
+                pass
+
+            # Generate desired reference
+            r_desired = self.traj_func(t)
+            self.current_raw_ref = r_desired.copy()
+
+            # Check safety
+            violations = self.check_safety(self.current_state)
+            needs_intervention = len(violations) > 0
+
+            # Apply RG if unsafe
+            if needs_intervention:
+                if not self.intervention_active:
+                    self.intervention_active = True
+                    self.intervention_count += 1
+                    print(f"\n[RG!] [REFERENCE GOVERNOR INTERVENTION #{self.intervention_count}] t={t:.2f}s")
+                    print(f"   Safety violations detected: {', '.join(violations)}")
+                    print(f"   Overriding reference to maintain safe flight")
+
+                # Generate safe reference
+                dt = t - self.prev_time
+                r_governed = self.safe_reference(self.current_state, r_desired, dt)
+                self.rg_log.append(1)  # RG active
+            else:
+                if self.intervention_active:
+                    self.intervention_active = False
+                    print(f"[RG-OK] [REFERENCE GOVERNOR RELEASE] t={t:.2f}s")
+                    print(f"   System safe, resuming normal trajectory tracking")
+
+                r_governed = r_desired
+                self.rg_log.append(0)  # RG inactive
+
+            # Send reference
+            from dataclasses import dataclass
+            @dataclass
+            class TrajPoint:
+                r: np.ndarray
+            traj_point = TrajPoint(r=r_governed)
+            try:
+                while not self.output_queue.empty():
+                    try:
+                        self.output_queue.get_nowait()
+                    except:
+                        break
+                self.output_queue.put(traj_point, timeout=0.01)
+            except queue.Full:
+                pass
+
+            self.prev_state = self.current_state.copy()
+            self.prev_time = t
+            time.sleep(self.dt)
+            t += self.dt
+
+        print(f"[{self.name}] Finished")
+
+
+# =====================================================
+# MAIN SIMULATION
+# =====================================================
+
+def run_replay_scenario():
+    """
+    Run Scenario 3: Replay Attack with Reference Governor Defense
+    """
+    print("\n" + "="*80)
+    print("SCENARIO 3: REPLAY ATTACK - MULTITHREADED WITH REFERENCE GOVERNOR")
+    print("="*80)
+    print("Attack: Stuxnet-style Replay (Record -> Replay + Malicious Injection)")
+    print("Defense: Reference Governor (Safety-Critical Control Override)")
+    print("="*80 + "\n")
+
+    # Simulation parameters
+    T = 18.0  # Extended time to see full attack + recovery
+    Ts = 0.01
+
+    # Load gains and create trajectory
+    gains = load_gains('mat')
+    traj_func = traj_figure8(amp=0.6, period=8.0, z0=0.5, t_start=1.0)
+
+    # Create synchronization objects
+    stop_event = threading.Event()
+    sensor_to_controller = queue.Queue(maxsize=10)
+    sensor_to_ground = queue.Queue(maxsize=10)
+    ground_to_controller = queue.Queue(maxsize=10)
+    controller_to_actuator = queue.Queue(maxsize=10)
+    actuator_to_sim = queue.Queue(maxsize=10)
+
+    # Create logger
+    logger = SimulationLogger()
+
+    # Create simulator
+    simulator = Simulator(
+        T=T, Ts=Ts,
+        control_queue=actuator_to_sim,
+        logger=logger,
+        stop_event=stop_event,
+        plant='nonlinear'
+    )
+
+    # Create normal sensor (no attack here)
+    sensor = Sensor(
+        rate_hz=100,
+        noise_std=0.05,
+        state_getter=simulator.get_state,
+        output_queues=[sensor_to_controller, sensor_to_ground],
+        stop_event=stop_event,
+        seed=42
+    )
+
+    # Create ground station with Reference Governor
+    ground_station = RG_GroundStation(
+        traj_func=traj_func,
+        T=T,
+        gains=gains,
+        rate_hz=50,
+        sensor_queue=sensor_to_ground,
+        output_queue=ground_to_controller,
+        stop_event=stop_event,
+        max_tilt_deg=45,  # Relaxed from 30 to allow normal figure-8 dynamics
+        min_altitude=0.05,  # Lowered from 0.2 to avoid false positives during startup
+        max_velocity=20.0,  # Increased from 15.0 to allow normal maneuvers
+        max_accel=30.0  # Increased from 20.0
+    )
+
+    # Create controller with simulation time tracking (needed for replay attack)
+    controller = SimTimeController(
+        gains=gains,
+        use_integrator=False,
+        sensor_queue=sensor_to_controller,
+        traj_queue=ground_to_controller,
+        output_queue=controller_to_actuator,
+        stop_event=stop_event,
+        rate_hz=250
+    )
+
+    # Create actuator with REPLAY ATTACK
+    actuator = ReplayAttack_Actuator(
+        record_start=2.0,  # Start recording at t=2s
+        record_duration=3.0,  # Record for 3 seconds
+        replay_start=8.0,  # Start replay at t=8s (after first figure-8)
+        replay_duration=3.0,  # Replay for 3 seconds
+        injection_magnitude=3.0,  # STRONGER attack to make it visible
+        rate_hz=500,
+        input_queue=controller_to_actuator,
+        output_queue=actuator_to_sim,
+        stop_event=stop_event
+    )
+
+    # Start all threads
+    threads = [simulator, sensor, ground_station, controller, actuator]
+    for thread in threads:
+        thread.start()
+
+    print(f"\nAll modules running...\n")
+
+    # Logging loop with real-time position printing
+    def logging_loop():
+        last_print_time = -1.0
+        while not stop_event.is_set():
+            try:
+                current_state = simulator.get_state()
+                logger.log(
+                    t=simulator.t,
+                    state=current_state,
+                    ref=ground_station.current_raw_ref.copy(),
+                    u=simulator.u.copy(),
+                    sensor=controller.current_sensor.copy()
+                )
+
+                # Print coordinates every second
+                if simulator.t - last_print_time >= 1.0:
+                    print(f"[t={simulator.t:.1f}s] Position: X={current_state[1]:6.3f}m, Y={current_state[3]:6.3f}m, Z={current_state[5]:6.3f}m")
+                    last_print_time = simulator.t
+
+            except Exception as e:
+                pass
+            time.sleep(Ts)
+
+    log_thread = threading.Thread(target=logging_loop, name="Logger", daemon=True)
+    log_thread.start()
+
+    # Wait for simulator to finish
+    simulator.join()
+
+    # Signal all threads to stop
+    stop_event.set()
+
+    # Wait for other threads to finish
+    for thread in threads:
+        if thread != simulator:
+            thread.join(timeout=2.0)
+
     print("\n" + "="*80)
     print("SIMULATION COMPLETE")
     print("="*80)
-    print(f"Reference Governor Interventions: {governor.intervention_count}")
-    print(f"Intervention Times: {[f'{t:.2f}s' for t in governor.intervention_times[:5]]}")
-    if len(governor.intervention_times) > 5:
-        print(f"                     ... and {len(governor.intervention_times)-5} more")
-    print(f"Malicious Commands Blocked: {governor.blocked_commands}")
-    print(f"\nSafety Violations Prevented:")
-    print(f"  - Control magnitude: {len(set(governor.safety_violations['control']))}")
-    print(f"  - Tilt: {len(set(governor.safety_violations['tilt']))}")
-    print(f"  - Altitude: {len(set(governor.safety_violations['altitude']))}")
-    print(f"  - Velocity: {len(set(governor.safety_violations['velocity']))}")
-    print(f"Recorded Measurements: {len(attack.recorded_measurements)}")
+    print(f"Recorded Commands: {len(actuator.recorded_commands)}")
+    print(f"Malicious Commands Injected: {actuator.malicious_count}")
+    print(f"RG Interventions: {ground_station.intervention_count}")
     print("="*80 + "\n")
-    
-    # Plot results
-    plot_replay_rg_scenario(tt, states, references, governed_refs,
-                           proposed_controls, actual_controls, safety_metrics,
-                           governor_flags, recording_flags, replay_flags,
-                           attack, governor)
+
+    # Get logged data
+    data = logger.get_arrays()
+    data['rg_active'] = np.array(ground_station.rg_log)
+    data['record_start'] = actuator.record_start
+    data['record_end'] = actuator.record_end
+    data['replay_start'] = actuator.replay_start
+    data['replay_end'] = actuator.replay_end
+    data['rg_count'] = ground_station.intervention_count
+
+    return data
 
 
 # =====================================================
-# ============   PLOTTING   ===========================
+# Plotting
 # =====================================================
 
-def plot_replay_rg_scenario(tt, states, refs, gov_refs, prop_controls, 
-                            actual_controls, safety_metrics, gov_flags,
-                            rec_flags, rep_flags, attack, governor):
-    """Visualize replay attack with reference governor defense"""
-    
-    # Figure 1: 3D Trajectory
-    fig1 = plt.figure(figsize=(12, 9))
+def plot_replay_results(data: Dict[str, Any]):
+    """Plot results showing replay attack with reference governor defense"""
+    from mpl_toolkits.mplot3d import Axes3D
+
+    t = data['t']
+    X = data['X']
+    R = data['R']
+    U = data['U']
+
+    # Synchronize array lengths
+    min_len = min(len(t), len(data['rg_active']))
+    t = t[:min_len]
+    X = X[:, :min_len]
+    R = R[:, :min_len]
+    U = U[:, :min_len]
+    rg_active = data['rg_active'][:min_len]
+
+    # Attack periods
+    record_start = data['record_start']
+    record_end = data['record_end']
+    replay_start = data['replay_start']
+    replay_end = data['replay_end']
+
+    recording_mask = (t >= record_start) & (t <= record_end)
+    replay_mask = (t >= replay_start) & (t <= replay_end)
+
+    # Figure 1: 3D Trajectory with attack phases
+    fig1 = plt.figure(figsize=(14, 10))
     ax = fig1.add_subplot(111, projection='3d')
-    
-    # Separate phases (skip governor active states to show clean result)
-    normal_idx, recording_idx, replay_idx, protected_idx = [], [], [], []
-    for i in range(len(tt)):
-        if gov_flags[i]:
-            continue  # Skip during active intervention for cleaner viz
-        if rec_flags[i]:
-            recording_idx.append(i)
-        elif rep_flags[i]:
-            replay_idx.append(i)
-        elif i > 0 and gov_flags[i-1]:
-            protected_idx.append(i)
-        else:
-            normal_idx.append(i)
-    
-    if normal_idx:
-        ax.scatter(states[normal_idx, 1], states[normal_idx, 3], states[normal_idx, 5],
-                   c='blue', s=2, alpha=0.6, label='Normal')
-    if recording_idx:
-        ax.scatter(states[recording_idx, 1], states[recording_idx, 3], states[recording_idx, 5],
-                   c='cyan', s=2, alpha=0.6, label='Recording Phase')
-    if replay_idx:
-        ax.scatter(states[replay_idx, 1], states[replay_idx, 3], states[replay_idx, 5],
-                   c='red', s=3, alpha=0.7, label='Under Attack (RG Active)')
-    if protected_idx:
-        ax.scatter(states[protected_idx, 1], states[protected_idx, 3], states[protected_idx, 5],
-                   c='green', s=5, alpha=0.8, label='RG Protected')
-    
-    ax.plot(refs[:, 1], refs[:, 3], refs[:, 5], 'k--',
-            linewidth=2, alpha=0.4, label='Reference')
-    
-    ax.set_xlabel('X [m]', fontsize=11)
-    ax.set_ylabel('Y [m]', fontsize=11)
-    ax.set_zlabel('Z [m]', fontsize=11)
-    ax.set_title('3D Trajectory - Replay Attack with Reference Governor Defense',
-                 fontsize=13, fontweight='bold')
+
+    # Color-coded trajectory segments
+    # Normal operation (before recording)
+    pre_record = t < record_start
+    if np.any(pre_record):
+        ax.plot(X[1, pre_record], X[3, pre_record], X[5, pre_record],
+                'b-', linewidth=2.5, alpha=0.9, label='Normal Operation')
+
+    # Recording phase (cyan)
+    if np.any(recording_mask):
+        ax.plot(X[1, recording_mask], X[3, recording_mask], X[5, recording_mask],
+                'cyan', linewidth=2.5, alpha=0.9, label='Recording Phase')
+
+    # Between recording and replay
+    between = (t > record_end) & (t < replay_start)
+    if np.any(between):
+        ax.plot(X[1, between], X[3, between], X[5, between],
+                'b-', linewidth=2.5, alpha=0.9)
+
+    # Replay attack (orange/red)
+    if np.any(replay_mask):
+        ax.plot(X[1, replay_mask], X[3, replay_mask], X[5, replay_mask],
+                color='orange', linewidth=2.5, alpha=0.9, label='Under Attack (Replay)')
+
+    # Post-attack recovery (green)
+    post_attack = t > replay_end
+    if np.any(post_attack):
+        ax.plot(X[1, post_attack], X[3, post_attack], X[5, post_attack],
+                'green', linewidth=2.5, alpha=0.9, label='Recovery')
+
+    # Reference trajectory
+    ax.plot(R[1, :], R[3, :], R[5, :], 'r--',
+            linewidth=1.5, alpha=0.4, label='Reference')
+
+    # Mark start and end
+    ax.scatter([X[1, 0]], [X[3, 0]], [X[5, 0]],
+               c='darkgreen', s=200, marker='o', label='Start', zorder=5, edgecolors='black', linewidths=2)
+    ax.scatter([X[1, -1]], [X[3, -1]], [X[5, -1]],
+               c='darkred', s=200, marker='X', label='End', zorder=5, edgecolors='black', linewidths=2)
+
+    ax.set_xlabel('X [m]', fontsize=12)
+    ax.set_ylabel('Y [m]', fontsize=12)
+    ax.set_zlabel('Z [m]', fontsize=12)
+    ax.set_title('3D Trajectory - Replay Attack with Reference Governor Defense\n(Blue=Normal, Cyan=Recording, Orange=Attack, Green=Recovery)',
+                 fontsize=14, fontweight='bold')
     ax.legend(fontsize=10)
-    ax.set_xlim([-10, 15])
-    ax.set_ylim([-15, 10])
-    ax.set_zlim([-1, 8])
+    ax.set_xlim([-1.5, 1.5])
+    ax.set_ylim([-1.5, 1.5])
+    ax.set_zlim([0, 1.0])
+    ax.view_init(elev=25, azim=45)
     plt.tight_layout()
-    
-    # Figure 2: Safety Metrics
-    fig2, axes = plt.subplots(4, 1, figsize=(14, 10))
-    
-    # Tilt Angle
-    axes[0].plot(tt, safety_metrics[:, 0], 'b-', linewidth=1.5, label='Tilt Angle')
-    axes[0].axhline(y=math.degrees(governor.max_tilt), color='r',
-                    linestyle='--', linewidth=2, label=f'Safety Limit')
-    axes[0].fill_between(tt, 0, safety_metrics[:, 0],
-                         where=(rep_flags > 0), alpha=0.15, color='red')
-    axes[0].fill_between(tt, 0, 100, where=(gov_flags > 0),
-                         alpha=0.2, color='green', label='Governor Active')
-    axes[0].set_ylabel('Tilt [°]', fontsize=11)
-    axes[0].set_title('Safety Monitoring - Reference Governor Protection',
-                      fontsize=12, fontweight='bold')
-    axes[0].legend(fontsize=9, loc='upper right')
-    axes[0].grid(True, alpha=0.3)
-    axes[0].set_ylim([0, 50])
-    
-    # Altitude
-    axes[1].plot(tt, safety_metrics[:, 1], 'b-', linewidth=1.5, label='Altitude')
-    axes[1].axhline(y=governor.min_altitude, color='r',
-                    linestyle='--', linewidth=2, label=f'Min Safe Alt')
-    axes[1].fill_between(tt, 0, safety_metrics[:, 1],
-                         where=(rep_flags > 0), alpha=0.15, color='red')
-    axes[1].fill_between(tt, 0, 10, where=(gov_flags > 0),
-                         alpha=0.2, color='green')
-    axes[1].set_ylabel('Altitude [m]', fontsize=11)
-    axes[1].legend(fontsize=9, loc='upper right')
-    axes[1].grid(True, alpha=0.3)
-    axes[1].set_ylim([-0.5, 6])
-    
-    # Velocity
-    axes[2].plot(tt, safety_metrics[:, 2], 'b-', linewidth=1.5, label='Velocity')
-    axes[2].axhline(y=governor.max_velocity, color='r',
-                    linestyle='--', linewidth=2, label=f'Max Safe Vel')
-    axes[2].fill_between(tt, 0, safety_metrics[:, 2],
-                         where=(rep_flags > 0), alpha=0.15, color='red')
-    axes[2].fill_between(tt, 0, 20, where=(gov_flags > 0),
-                         alpha=0.2, color='green')
-    axes[2].set_ylabel('Velocity [m/s]', fontsize=11)
-    axes[2].legend(fontsize=9, loc='upper right')
-    axes[2].grid(True, alpha=0.3)
-    axes[2].set_ylim([0, 20])
-    
-    # Control Magnitude
-    axes[3].plot(tt, safety_metrics[:, 3], 'purple', linewidth=1.5, label='Control Magnitude')
-    axes[3].axhline(y=governor.max_control_magnitude, color='r',
-                    linestyle='--', linewidth=2, label=f'Max Safe Control')
-    axes[3].fill_between(tt, 0, safety_metrics[:, 3],
-                         where=(rep_flags > 0), alpha=0.15, color='red', label='Replay Attack')
-    axes[3].fill_between(tt, 0, 30, where=(gov_flags > 0),
-                         alpha=0.2, color='green', label='Gov Active')
-    axes[3].set_ylabel('Control Mag', fontsize=11)
-    axes[3].set_xlabel('Time [s]', fontsize=11)
-    axes[3].legend(fontsize=9, loc='upper right')
-    axes[3].grid(True, alpha=0.3)
-    axes[3].set_ylim([0, 25])
-    
-    plt.tight_layout()
-    
-    # Figure 3: Control Comparison
-    fig3, axes = plt.subplots(4, 1, figsize=(14, 10))
-    control_labels = ['Thrust (F_z)', 'Roll Torque (τ_x)', 'Pitch Torque (τ_y)', 'Yaw Torque (τ_z)']
-    
-    for i in range(4):
-        # Show proposed (malicious) vs actual (safe) control
-        axes[i].plot(tt, prop_controls[:, i], 'r:', linewidth=2,
-                     alpha=0.6, label='Proposed (Malicious)')
-        axes[i].plot(tt, actual_controls[:, i], 'b-', linewidth=1.5,
-                     label='Actual (RG Override)')
-        axes[i].fill_between(tt, -20, 20, where=(rep_flags > 0),
-                             alpha=0.15, color='red', label='Replay Period')
-        axes[i].fill_between(tt, -20, 20, where=(gov_flags > 0),
-                             alpha=0.2, color='green', label='Governor Active')
-        axes[i].set_ylabel(control_labels[i], fontsize=10)
+
+    # Figure 2: Position Tracking
+    fig2, axes = plt.subplots(3, 1, figsize=(14, 9))
+    positions = ['X', 'Y', 'Z']
+    indices = [1, 3, 5]
+
+    for i, (pos, idx) in enumerate(zip(positions, indices)):
+        axes[i].plot(t, X[idx, :], 'b-', linewidth=2, label='Actual', alpha=0.8)
+        axes[i].plot(t, R[idx, :], 'r--', linewidth=2, alpha=0.6, label='Reference')
+        axes[i].axvspan(record_start, record_end, alpha=0.15, color='cyan', label='Recording' if i == 0 else '')
+        axes[i].axvspan(replay_start, replay_end, alpha=0.15, color='orange', label='Replay Attack' if i == 0 else '')
+        axes[i].set_ylabel(f'{pos} [m]', fontsize=11)
+        axes[i].legend(fontsize=9)
         axes[i].grid(True, alpha=0.3)
-        axes[i].legend(fontsize=8, loc='upper right')
-        axes[i].set_ylim([-18, 18])
-    
-    axes[0].set_title('Control Signals - Reference Governor Override',
-                      fontsize=12, fontweight='bold')
-    axes[3].set_xlabel('Time [s]', fontsize=11)
+
+    axes[0].set_title('Position Tracking - Replay Attack with RG Defense', fontsize=13, fontweight='bold')
+    axes[2].set_xlabel('Time [s]', fontsize=11)
     plt.tight_layout()
-    
+
+    # Figure 3: Reference Governor Activity
+    fig3, axes3 = plt.subplots(3, 1, figsize=(14, 9))
+
+    # Position error
+    position_error = np.sqrt((X[1, :] - R[1, :])**2 + (X[3, :] - R[3, :])**2 + (X[5, :] - R[5, :])**2)
+    axes3[0].plot(t, position_error, 'purple', linewidth=1.5, label='Position Error')
+    axes3[0].axvspan(record_start, record_end, alpha=0.15, color='cyan', label='Recording')
+    axes3[0].axvspan(replay_start, replay_end, alpha=0.15, color='orange', label='Replay Attack')
+    axes3[0].fill_between(t, 0, np.max(position_error)*1.2, where=(rg_active > 0),
+                          alpha=0.2, color='green', label='RG Active')
+    axes3[0].set_ylabel('Error [m]', fontsize=11)
+    axes3[0].set_title('Position Tracking Error (shows RG activation)', fontsize=13, fontweight='bold')
+    axes3[0].legend(fontsize=9)
+    axes3[0].grid(True, alpha=0.3)
+
+    # Control magnitude
+    control_mag = np.sqrt(U[0, :]**2 + U[1, :]**2 + U[2, :]**2 + U[3, :]**2)
+    axes3[1].plot(t, control_mag, 'blue', linewidth=1.5, label='Control Magnitude')
+    axes3[1].axvspan(record_start, record_end, alpha=0.15, color='cyan', label='Recording')
+    axes3[1].axvspan(replay_start, replay_end, alpha=0.15, color='orange', label='Replay Attack')
+    axes3[1].fill_between(t, 0, np.max(control_mag)*1.2, where=(rg_active > 0),
+                          alpha=0.2, color='green', label='RG Active')
+    axes3[1].set_ylabel('Control Mag', fontsize=11)
+    axes3[1].set_title('Control Command Magnitude', fontsize=13, fontweight='bold')
+    axes3[1].legend(fontsize=9)
+    axes3[1].grid(True, alpha=0.3)
+
+    # RG intervention timeline
+    axes3[2].fill_between(t, 0, rg_active, alpha=0.5, color='green', label='Reference Governor Active')
+    axes3[2].axvspan(record_start, record_end, alpha=0.15, color='cyan', label='Recording')
+    axes3[2].axvspan(replay_start, replay_end, alpha=0.15, color='orange', label='Replay Attack')
+    axes3[2].set_ylabel('RG Status', fontsize=11)
+    axes3[2].set_xlabel('Time [s]', fontsize=11)
+    axes3[2].set_title('Reference Governor Intervention Timeline', fontsize=13, fontweight='bold')
+    axes3[2].set_ylim([-0.1, 1.2])
+    axes3[2].set_yticks([0, 1])
+    axes3[2].set_yticklabels(['Inactive', 'Active'])
+    axes3[2].legend(fontsize=9)
+    axes3[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
     plt.show()
 
+    # Calculate performance metrics
+    xy_error = np.sqrt((X[1, :] - R[1, :]) ** 2 + (X[3, :] - R[3, :]) ** 2)
+    print(f"\nPerformance Metrics:")
+    print(f"  XY RMS Error: {np.sqrt(np.mean(xy_error**2)):.4f} m")
+    print(f"  XY Max Error: {np.max(xy_error):.4f} m")
+    print(f"  Z RMS Error: {np.sqrt(np.mean((X[5,:] - R[5,:])**2)):.4f} m\n")
 
-if __name__ == "__main__":
-    run_replay_with_rg_simulation()
+
+if __name__ == '__main__':
+    data = run_replay_scenario()
+    plot_replay_results(data)
