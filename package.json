@@ -1,0 +1,41 @@
+{
+  "name": "cps-drone-cyber-defense",
+  "version": "1.0.0",
+  "description": "CPS Drone Simulation with Cyber Attack Scenarios and Defense Mechanisms",
+  "scripts": {
+    "test": "python main_multithreaded.py --traj figure8 --use-rg --T 12",
+    "baseline": "python main_multithreaded.py --traj figure8 --use-rg --T 12",
+    "scenario1": "python scenario1_fdi_attack.py",
+    "scenario2": "python scenario2_dos_attack.py",
+    "scenario3": "python scenario3_replay_attack.py",
+    "attack:gps": "python scenario1_fdi_attack.py",
+    "attack:dos": "python scenario2_dos_attack.py",
+    "attack:replay": "python scenario3_replay_attack.py",
+    "multithreaded": "python main_multithreaded.py --traj figure8 --use-rg --T 12",
+    "mt:norg": "python main_multithreaded.py --traj figure8 --T 12",
+    "mt:hover": "python main_multithreaded.py --traj hover --use-rg --T 10",
+    "all": "npm run baseline && npm run scenario1 && npm run scenario2 && npm run scenario3",
+    "attacks": "npm run scenario1 && npm run scenario2 && npm run scenario3",
+    "demo": "npm run baseline",
+    "presentation": "npm run baseline && echo '\n\n=== Press Ctrl+C to stop and run next scenario ===' && npm run scenario1",
+    "help": "node -e \"console.log('\\n' + '='.repeat(80) + '\\n' + 'CPS DRONE SIMULATION - PROJECT PART B' + '\\n' + '='.repeat(80) + '\\n\\n' + 'BASELINE (Normal Operation - Multithreaded Architecture):\\n' + '  npm test              - Run multithreaded figure-8 with Reference Governor\\n' + '  npm run baseline      - Same as npm test\\n' + '  npm run multithreaded - Same as npm test\\n\\n' + 'CYBER ATTACK SCENARIOS:\\n' + '  npm run scenario1     - Scenario 1: GPS Spoofing (FDI Attack)\\n' + '  npm run scenario2     - Scenario 2: DoS Attack (Packet Drops)\\n' + '  npm run scenario3     - Scenario 3: Replay Attack (Stuxnet-style)\\n\\n' + 'SHORTCUTS:\\n' + '  npm run attack:gps    - Same as scenario1\\n' + '  npm run attack:dos    - Same as scenario2\\n' + '  npm run attack:replay - Same as scenario3\\n\\n' + 'MULTITHREADED OPTIONS:\\n' + '  npm run mt:norg       - Multithreaded WITHOUT Reference Governor\\n' + '  npm run mt:hover      - Multithreaded hover test (with RG)\\n\\n' + 'RUN ALL:\\n' + '  npm run all           - Run baseline + all 3 attack scenarios\\n' + '  npm run attacks       - Run only the 3 attack scenarios\\n\\n' + 'PRESENTATION MODE:\\n' + '  npm run presentation  - Demo mode (baseline then attacks)\\n\\n' + '='.repeat(80) + '\\n')\""
+  },
+  "keywords": [
+    "cyber-physical-systems",
+    "cyber-attack",
+    "defense",
+    "drone",
+    "simulation",
+    "FDI",
+    "DoS",
+    "replay-attack",
+    "software-rejuvenation",
+    "reference-governor"
+  ],
+  "author": "CPS Course Project",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "your-repo-url"
+  }
+}

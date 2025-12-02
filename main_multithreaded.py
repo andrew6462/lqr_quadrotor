@@ -259,20 +259,25 @@ class Controller(threading.Thread):
         self.output_queue = output_queue
         self.stop_event = stop_event
         self.dt = 1.0 / rate_hz
-        
+
         # State
         self.v = np.zeros(12)  # Governed reference
         self.xi = np.zeros(12)  # Integrator state
         self.current_ref = np.zeros(12)
         self.current_sensor = np.zeros(12)
-        
+
         # Limits
         self.u_max = np.array([FZ_MAX, TAU_X_MAX, TAU_Y_MAX, TAU_Z_MAX])
         self.u_min = -self.u_max
+
+        # RG tracking
+        self.rg_intervention_count = 0
+        self.last_rg_intervention_time = -1.0
+        self.current_time = 0.0
         
     def run(self):
         print(f"[{self.name}] Started - control rate {1/self.dt:.1f} Hz, RG={self.use_rg}, INT={self.use_integrator}")
-        
+
         while not self.stop_event.is_set():
             # Get latest sensor data (non-blocking)
             try:
@@ -280,46 +285,57 @@ class Controller(threading.Thread):
                 self.current_sensor = sensor_data.state
             except queue.Empty:
                 pass
-            
+
             # Get latest trajectory reference (non-blocking)
             try:
                 traj_point = self.traj_queue.get(timeout=0.01)
                 self.current_ref = traj_point.r
+                self.current_time = traj_point.timestamp
             except queue.Empty:
                 pass
-            
-            # Compute control
+
+            # Compute control with RG tracking
+            v_prev = self.v.copy()
             if self.use_rg:
                 self.v = govern_reference(
                     self.current_sensor, self.v, self.current_ref,
                     self.gains.K, self.u_min, self.u_max
                 )
+
+                # Check if RG intervened (reference was constrained)
+                ref_distance = np.linalg.norm(self.current_ref - self.v)
+                if ref_distance > 0.01:  # RG constrained the reference
+                    if self.current_time - self.last_rg_intervention_time > 0.5:  # Avoid spam
+                        self.rg_intervention_count += 1
+                        self.last_rg_intervention_time = self.current_time
             else:
                 self.v = self.current_ref
-            
+
             err = self.current_sensor - self.v
             u = -self.gains.K @ err
-            
+
             # Integrator (position errors only)
             if self.use_integrator and self.gains.Kc is not None:
                 pos_idx = [1, 3, 5]
                 epos = self.v[pos_idx] - self.current_sensor[pos_idx]
                 self.xi[pos_idx] += epos * self.dt
                 u = u - (self.gains.Kc @ self.xi[pos_idx])
-            
+
             # Saturate
             u_clip = np.minimum(np.maximum(u, self.u_min), self.u_max)
-            
+
             # Send to simulator
             cmd = ControlCommand(timestamp=time.time(), u=u_clip)
             try:
                 self.output_queue.put(cmd, timeout=0.1)
             except queue.Full:
                 pass
-            
+
             time.sleep(self.dt)
-        
+
         print(f"[{self.name}] Finished")
+        if self.use_rg:
+            print(f"[{self.name}] Reference Governor interventions: {self.rg_intervention_count}")
 
 # ======================================================================================
 # THREAD 4: Simulator (Plant Dynamics Integration)
@@ -450,6 +466,9 @@ def run_multithreaded_simulation(
     
     # Logging thread
     def logging_loop():
+        last_print_time = 0
+        print_interval = 1.0  # Print every 1 second
+
         while not stop_event.is_set():
             # Get current reference from ground station queue (peek)
             try:
@@ -458,7 +477,7 @@ def run_multithreaded_simulation(
                 traj_to_controller.put(traj_point)  # Put it back
             except:
                 current_ref = np.zeros(12)
-            
+
             # Get sensor measurement
             try:
                 sensor_data = sensor_to_controller.get(timeout=0.01)
@@ -466,7 +485,7 @@ def run_multithreaded_simulation(
                 sensor_to_controller.put(sensor_data)
             except:
                 sensor_meas = np.zeros(12)
-            
+
             # Get control
             try:
                 cmd = controller_to_sim.get(timeout=0.01)
@@ -474,15 +493,36 @@ def run_multithreaded_simulation(
                 controller_to_sim.put(cmd)
             except:
                 current_u = np.zeros(4)
-            
+
             # Log
+            current_state = simulator.get_state()
             logger.log(
                 t=simulator.t,
-                state=simulator.get_state(),
+                state=current_state,
                 ref=current_ref,
                 u=current_u,
                 sensor=sensor_meas
             )
+
+            # Print trajectory coordinates at intervals
+            if simulator.t - last_print_time >= print_interval:
+                # Calculate tracking error
+                pos_error = np.sqrt((current_state[1] - current_ref[1])**2 +
+                                   (current_state[3] - current_ref[3])**2 +
+                                   (current_state[5] - current_ref[5])**2)
+
+                # Check if RG is active
+                rg_status = ""
+                if use_rg:
+                    ref_distance = np.linalg.norm(controller.current_ref - controller.v)
+                    if ref_distance > 0.01:
+                        rg_status = " | [RG ACTIVE - Constraining reference]"
+                    else:
+                        rg_status = " | [RG: OK]"
+
+                print(f"t={simulator.t:5.2f}s | Pos: x={current_state[1]:6.3f}, y={current_state[3]:6.3f}, z={current_state[5]:6.3f}m | Error: {pos_error:.4f}m{rg_status}")
+                last_print_time = simulator.t
+
             time.sleep(Ts)
     
     log_thread = threading.Thread(target=logging_loop, name="Logger")
@@ -499,12 +539,39 @@ def run_multithreaded_simulation(
     stop_event.set()
     for thread in threads[1:]:
         thread.join(timeout=2.0)
-    
+
     print("\n" + "="*70)
     print("SIMULATION COMPLETE")
+    print("="*70)
+
+    # Performance summary
+    data = logger.get_arrays()
+    final_state = data['X'][:, -1]
+    final_ref = data['R'][:, -1]
+    all_states = data['X'].T
+    all_refs = data['R'].T
+
+    # Calculate tracking performance
+    pos_errors = np.sqrt((all_states[:, 1] - all_refs[:, 1])**2 +
+                         (all_states[:, 3] - all_refs[:, 3])**2 +
+                         (all_states[:, 5] - all_refs[:, 5])**2)
+    mean_error = np.mean(pos_errors)
+    max_error = np.max(pos_errors)
+
+    print(f"\nFinal Position:    x={final_state[1]:.3f}m, y={final_state[3]:.3f}m, z={final_state[5]:.3f}m")
+    print(f"Target Reference:  x={final_ref[1]:.3f}m, y={final_ref[3]:.3f}m, z={final_ref[5]:.3f}m")
+    print(f"\nTracking Performance:")
+    print(f"  Mean Error:  {mean_error:.4f}m")
+    print(f"  Max Error:   {max_error:.4f}m")
+
+    if use_rg:
+        print(f"\nReference Governor:")
+        print(f"  Total Interventions: {controller.rg_intervention_count}")
+        print(f"  Status: {'ACTIVE - Safety constraints enforced' if controller.rg_intervention_count > 0 else 'STANDBY - No constraints needed'}")
+
     print("="*70 + "\n")
-    
-    return logger.get_arrays()
+
+    return data
 
 # ======================================================================================
 # Trajectories
@@ -539,50 +606,91 @@ def plot_results(data: Dict[str, Any], save_prefix: str = 'mt'):
     R = data['R']
     U = data['U']
     S = data['S']
-    
-    # XY Trajectory
-    fig1 = plt.figure(figsize=(8, 6))
-    plt.plot(X[1,:], X[3,:], 'b-', label='True State', linewidth=2)
-    plt.plot(S[1,:], S[3,:], 'r--', alpha=0.5, label='Sensor Measurement')
-    plt.plot(R[1,:], R[3,:], 'g:', label='Reference', linewidth=2)
-    plt.xlabel('x [m]')
-    plt.ylabel('y [m]')
-    plt.title('XY Trajectory (Multithreaded Simulation)')
-    plt.legend()
-    plt.grid(True)
+
+    # Figure 1: 2D Figure-8 Trajectory (XY Top View)
+    fig1 = plt.figure(figsize=(12, 10))
+    plt.plot(X[1,:], X[3,:], 'b-', label='Actual Trajectory', linewidth=3, alpha=0.8)
+    plt.plot(R[1,:], R[3,:], 'r--', label='Reference (Figure-8)', linewidth=2, alpha=0.6)
+    plt.scatter([X[1,0]], [X[3,0]], c='green', s=200, marker='o',
+                label='Start', zorder=5, edgecolors='black', linewidths=2)
+    plt.scatter([X[1,-1]], [X[3,-1]], c='red', s=200, marker='X',
+                label='End', zorder=5, edgecolors='black', linewidths=2)
+    plt.xlabel('X [m]', fontsize=14, fontweight='bold')
+    plt.ylabel('Y [m]', fontsize=14, fontweight='bold')
+    plt.title('Figure-8 Trajectory - Top View (XY Plane)\nMultithreaded with Reference Governor',
+              fontsize=16, fontweight='bold')
+    plt.legend(fontsize=12, loc='upper right')
+    plt.grid(True, alpha=0.3)
     plt.axis('equal')
+    plt.tight_layout()
     if save_prefix:
-        plt.savefig(f'{save_prefix}_xy.png', dpi=150, bbox_inches='tight')
-    
-    # Altitude
-    fig2 = plt.figure(figsize=(10, 4))
-    plt.plot(t, X[5,:], 'b-', label='True z', linewidth=2)
-    plt.plot(t, S[5,:], 'r--', alpha=0.5, label='Sensor z')
-    plt.plot(t, R[5,:], 'g:', label='Reference z', linewidth=2)
-    plt.xlabel('Time [s]')
-    plt.ylabel('z [m]')
-    plt.title('Altitude Response (Multithreaded)')
-    plt.legend()
-    plt.grid(True)
+        plt.savefig(f'{save_prefix}_figure8_2d.png', dpi=150, bbox_inches='tight')
+        print(f"[PLOT] Saved: {save_prefix}_figure8_2d.png")
+
+    # Figure 2: 3D Figure-8 Trajectory
+    fig2 = plt.figure(figsize=(14, 10))
+    ax = fig2.add_subplot(111, projection='3d')
+    ax.plot(X[1,:], X[3,:], X[5,:], 'b-', label='Actual Trajectory', linewidth=3, alpha=0.8)
+    ax.plot(R[1,:], R[3,:], R[5,:], 'r--', label='Reference (Figure-8)', linewidth=2, alpha=0.6)
+    ax.scatter([X[1,0]], [X[3,0]], [X[5,0]], c='green', s=150, marker='o',
+               label='Start', zorder=5, edgecolors='black', linewidths=2)
+    ax.scatter([X[1,-1]], [X[3,-1]], [X[5,-1]], c='red', s=150, marker='X',
+               label='End', zorder=5, edgecolors='black', linewidths=2)
+    ax.set_xlabel('X [m]', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Y [m]', fontsize=13, fontweight='bold')
+    ax.set_zlabel('Z [m]', fontsize=13, fontweight='bold')
+    ax.set_title('Figure-8 Trajectory - 3D View\nMultithreaded with Reference Governor',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=11, loc='upper left')
+    ax.grid(True, alpha=0.3)
+    ax.view_init(elev=25, azim=45)
+    plt.tight_layout()
     if save_prefix:
-        plt.savefig(f'{save_prefix}_altitude.png', dpi=150, bbox_inches='tight')
-    
-    # Control Inputs
-    fig3 = plt.figure(figsize=(10, 6))
-    labels = ['Fz', 'τx', 'τy', 'τz']
+        plt.savefig(f'{save_prefix}_figure8_3d.png', dpi=150, bbox_inches='tight')
+        print(f"[PLOT] Saved: {save_prefix}_figure8_3d.png")
+
+    # Figure 3: Position Tracking Over Time
+    fig3, axes = plt.subplots(3, 1, figsize=(14, 9))
+    positions = ['X', 'Y', 'Z']
+    indices = [1, 3, 5]
+
+    for i, (pos, idx) in enumerate(zip(positions, indices)):
+        axes[i].plot(t, X[idx,:], 'b-', linewidth=2, label='Actual')
+        axes[i].plot(t, R[idx,:], 'r--', linewidth=2, alpha=0.7, label='Reference')
+        axes[i].set_ylabel(f'{pos} [m]', fontsize=12, fontweight='bold')
+        axes[i].legend(fontsize=10, loc='upper right')
+        axes[i].grid(True, alpha=0.3)
+
+    axes[0].set_title('Position Tracking Over Time - Multithreaded with Reference Governor',
+                      fontsize=13, fontweight='bold')
+    axes[2].set_xlabel('Time [s]', fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    if save_prefix:
+        plt.savefig(f'{save_prefix}_positions.png', dpi=150, bbox_inches='tight')
+        print(f"[PLOT] Saved: {save_prefix}_positions.png")
+
+    # Figure 4: Control Inputs
+    fig4 = plt.figure(figsize=(14, 8))
+    labels = ['Thrust (Fz)', 'Roll Torque (τx)', 'Pitch Torque (τy)', 'Yaw Torque (τz)']
     for i in range(4):
         plt.subplot(2, 2, i+1)
         plt.plot(t, U[i,:], 'b-', linewidth=1.5)
-        plt.axhline(y=FZ_MAX if i==0 else TAU_X_MAX, color='r', linestyle='--', alpha=0.5)
+        plt.axhline(y=FZ_MAX if i==0 else TAU_X_MAX, color='r', linestyle='--', alpha=0.5, label='Limits')
         plt.axhline(y=-FZ_MAX if i==0 else -TAU_X_MAX, color='r', linestyle='--', alpha=0.5)
-        plt.xlabel('Time [s]')
-        plt.ylabel(labels[i])
-        plt.grid(True)
-    plt.suptitle('Control Inputs (Multithreaded)')
+        plt.xlabel('Time [s]', fontsize=11)
+        plt.ylabel(labels[i], fontsize=11)
+        plt.title(labels[i], fontsize=11, fontweight='bold')
+        plt.grid(True, alpha=0.3)
+        if i == 0:
+            plt.legend(fontsize=9)
+    plt.suptitle('Control Inputs - Multithreaded with Reference Governor',
+                 fontsize=13, fontweight='bold')
     plt.tight_layout()
     if save_prefix:
         plt.savefig(f'{save_prefix}_controls.png', dpi=150, bbox_inches='tight')
-    
+        print(f"[PLOT] Saved: {save_prefix}_controls.png")
+
+    print("\n[OK] All plots generated!\n")
     plt.show()
 
 # ======================================================================================

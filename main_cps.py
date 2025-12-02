@@ -51,9 +51,18 @@ def quadrotor_u(x, cu):
 # ==============   FIGURE-8 TRAJECTORY   ==============
 # =====================================================
 def figure8(t):
-    x = 5 * math.sin(2*math.pi*t/20)
-    y = 5 * math.sin(4*math.pi*t/20)
-    z = 2
+    """
+    Improved figure-8 trajectory (matches main_multithreaded.py)
+    amplitude = 1.0m, period = 6.0s, altitude = 0.5m
+    """
+    amp = 1.0
+    period = 6.0
+    z0 = 0.5
+    w = 2.0 * math.pi / period
+
+    x = amp * math.sin(w * t)
+    y = amp * math.sin(2 * w * t)
+    z = z0
     return x, y, z
 
 # =====================================================
